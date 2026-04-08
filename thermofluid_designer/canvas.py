@@ -88,6 +88,7 @@ class CanvasSignals(QObject):
     canvas_right_clicked      = pyqtSignal(float, float)
     fitting_selected          = pyqtSignal(str, str)      # pipe_edge_id, fitting_id
     fitting_placement_requested = pyqtSignal(str, float)  # pipe_edge_id, position_t
+    escape_pressed            = pyqtSignal()
     # Emitted when a drag ends and position actually changed (for undo tracking)
     move_finished             = pyqtSignal(str, float, float, float, float)  # node_id, old_x, old_y, new_x, new_y
     inline_move_finished      = pyqtSignal(str, float, float, float, float)  # edge_id, old_x, old_y, new_x, new_y
@@ -710,12 +711,11 @@ class FittingIconItem(QGraphicsItem):
         self.pipe_edge_id = pipe_edge_id
         self.signals      = signals
         self._hover       = False
-        self._selected    = False
 
         self.setAcceptHoverEvents(True)
         self.setZValue(1.5)
-        # Not independently selectable via rubber-band; handled via click
-        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        # Enable standard selection
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
 
     def boundingRect(self) -> QRectF:
         r = self.HIT_R + 2
@@ -724,7 +724,8 @@ class FittingIconItem(QGraphicsItem):
     def paint(self, painter, option, widget=None):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         sz   = self.RADIUS
-        fill = C["selected"] if (self._selected or self._hover) else C["fitting"]
+        # Use isSelected() instead of custom flag
+        fill = C["selected"] if (self.isSelected() or self._hover) else C["fitting"]
         painter.setPen(QPen(fill.darker(140), 1.5))
         painter.setBrush(QBrush(fill))
         poly = QPolygonF([
@@ -737,18 +738,14 @@ class FittingIconItem(QGraphicsItem):
         painter.drawText(QRectF(-6, -5, 12, 10), Qt.AlignmentFlag.AlignCenter, "K")
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
-            # Deselect all sibling fittings on same pipe, select this one
-            if self.scene():
-                for item in self.scene().items():
-                    if (isinstance(item, FittingIconItem)
-                            and item.pipe_edge_id == self.pipe_edge_id):
-                        item._selected = (item is self)
-                        item.update()
-            self._selected = True
-            self.update()
-            self.signals.fitting_selected.emit(self.pipe_edge_id, self.fitting_id)
-            event.accept()
+        # Let standard selection logic work (selection handled by scene)
+        super().mousePressEvent(event)
+
+    def itemChange(self, change, value):
+        if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
+            if value:
+                self.signals.fitting_selected.emit(self.pipe_edge_id, self.fitting_id)
+        return super().itemChange(change, value)
 
     def hoverEnterEvent(self, event):
         self._hover = True
@@ -1172,6 +1169,8 @@ class ThermofluidCanvas(QGraphicsScene):
             if self._fitting_mode:
                 self._fitting_mode = False
                 self._clear_pipe_highlight()
+            self.signals.escape_pressed.emit()
+            self.signals.nothing_selected.emit()
         super().keyPressEvent(event)
 
 

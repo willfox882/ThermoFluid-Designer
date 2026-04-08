@@ -50,8 +50,9 @@ class PlottingWidget(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._network:  Optional[PipeNetwork]  = None
-        self._result:   Optional[SolverResult] = None
+        self._network:     Optional[PipeNetwork]  = None
+        self._result:      Optional[SolverResult] = None
+        self._pump_groups: list = []
         self._build_ui()
 
     # ── Layout ────────────────────────────────────────────────────────────────
@@ -140,19 +141,23 @@ class PlottingWidget(QWidget):
         self._draw_empty_pump_plot()
 
     def update_results(self, network: PipeNetwork, result: SolverResult,
-                       system_curves: dict = None):
+                       system_curves: dict = None,
+                       pump_groups: list = None):
         """
         Refresh all plots and tables with solver results.
 
-        system_curves : { pump_edge_id: (Q_arr, h_arr) }   (from solver)
+        system_curves : { pump_edge_id: (Q_arr, h_arr) }
+        pump_groups   : list of group dicts from NetworkSolver.detect_pump_groups()
         """
-        self._network = network
-        self._result  = result
+        self._network     = network
+        self._result      = result
+        self._pump_groups = pump_groups or []
         self._draw_pump_plot(system_curves or {})
         self._populate_tables(result)
 
     def clear(self):
-        self._result = None
+        self._result      = None
+        self._pump_groups = []
         self._draw_empty_pump_plot()
         self._node_table.setRowCount(0)
         self._edge_table.setRowCount(0)
@@ -223,64 +228,164 @@ class PlottingWidget(QWidget):
         self._pump_canvas.draw()
 
     def _draw_pump_plot(self, system_curves: dict):
+        """
+        Draw the pump curve / system curve plot.
+
+        system_curves keys:
+          <pump_edge_id>   → (Q_arr, h_arr) for each pump (on OR off)
+          "__standalone__" → (Q_arr, h_arr) when no pumps in network
+
+        Pump ON  → pump curve + system curve + operating point
+        Pump OFF → system curve only (no pump curve, no operating point)
+        No pump  → standalone system curve with natural-flow marker
+        """
         if self._network is None or self._result is None:
             return
 
-        pump_edges = self._network.get_pumps()
-        if not pump_edges:
+        pump_edges  = self._network.get_pumps()
+        on_pumps    = [pe for pe in pump_edges if pe.component.is_on]
+        has_on_pump = bool(on_pumps)
+
+        # Any system curve data present (per-pump or standalone)?
+        has_any_curve = bool(system_curves)
+        if not has_any_curve and not has_on_pump:
             self._draw_empty_pump_plot()
             return
 
         ax = self._pump_ax
         ax.clear()
-        ax.set_facecolor(BG)
         ax.set_facecolor("#fafbfd")
         ax.grid(True, linestyle="--", linewidth=0.5, color="#dde0e8", alpha=0.8)
 
-        legend_handles = []
+        legend_handles    = []
+        sys_curve_plotted = False   # only one legend entry for system curve
+        op_patch_added    = False   # only one legend entry for operating point
 
+        # Build a lookup: pump_id → group
+        pid_to_group = {}
+        for grp in self._pump_groups:
+            for pid in grp["pump_ids"]:
+                pid_to_group[pid] = grp
+
+        plotted_groups = set()   # track which groups have been drawn
+
+        # ── Per-pump / per-group plots ─────────────────────────────────────────
         for pump_edge in pump_edges:
             pump_comp: Pump = pump_edge.component
             eid = pump_edge.edge_id
+            grp = pid_to_group.get(eid, {"type": "single", "pump_ids": [eid]})
+            grp_key = id(grp)
+            cfg = grp.get("type", "single")
 
-            # Pump characteristic curve
+            # ── System curve: draw once per group ────────────────────────────
+            if grp_key not in plotted_groups:
+                ref_eid = grp["pump_ids"][0]
+                if ref_eid in system_curves:
+                    Qs_arr, hs_arr = system_curves[ref_eid]
+                    Qs_Ls = Qs_arr * 1000.0
+                    lbl = "System curve" if not sys_curve_plotted else "_nolegend_"
+                    line_sys, = ax.plot(Qs_Ls, hs_arr, color=BLUE, lw=2.0,
+                                        linestyle="--", label=lbl)
+                    if not sys_curve_plotted:
+                        legend_handles.append(line_sys)
+                        sys_curve_plotted = True
+
+                # ── Combined pump curve (series / parallel) ──────────────────
+                cQ = grp.get("combined_Q")
+                ch = grp.get("combined_h")
+                if cQ is not None and len(cQ) > 1:
+                    cQ_Ls = cQ * 1000.0
+                    cfg_label = f"Combined ({cfg})"
+                    line_comb, = ax.plot(cQ_Ls, ch, color="#a040d0", lw=2.2,
+                                         label=cfg_label)
+                    legend_handles.append(line_comb)
+
+                    # Combined operating point
+                    op = grp.get("op_point")
+                    if op is not None:
+                        Q_op_Ls = op[0] * 1000.0
+                        h_op    = op[1]
+                        ax.scatter([Q_op_Ls], [h_op], color=GRN, s=90, zorder=5,
+                                   edgecolors="white", linewidths=1.5, marker="*")
+                        ax.annotate(
+                            f" Combined OP\n Q = {Q_op_Ls:.2f} L/s\n h = {h_op:.2f} m",
+                            xy=(Q_op_Ls, h_op),
+                            xytext=(Q_op_Ls + cQ_Ls[-1] * 0.05, h_op + max(ch) * 0.05),
+                            fontsize=7.5, color=FG,
+                            arrowprops=dict(arrowstyle="->", color=GRN, lw=1.2),
+                        )
+                        if not op_patch_added:
+                            op_patch = mpatches.Patch(color=GRN,
+                                                       label="Operating point")
+                            legend_handles.append(op_patch)
+                            op_patch_added = True
+
+                plotted_groups.add(grp_key)
+
+            if not pump_comp.is_on:
+                continue   # OFF — system curve already drawn
+
+            # ── Individual pump characteristic curve ──────────────────────────
             Q_arr, hp_arr = pump_comp.curve_data(n_points=300)
-            Q_Ls  = Q_arr * 1000.0          # convert to L/s for readability
-
-            line_pump, = ax.plot(Q_Ls, hp_arr, color=RED, lw=2.2,
+            Q_Ls = Q_arr * 1000.0
+            # Use lighter style for individual curves in a group
+            lw_ind  = 1.4 if cfg != "single" else 2.2
+            ls_ind  = ":"  if cfg != "single" else "-"
+            line_pump, = ax.plot(Q_Ls, hp_arr, color=RED, lw=lw_ind,
+                                 linestyle=ls_ind,
                                  label=f"Pump: {eid}")
             legend_handles.append(line_pump)
 
-            # System curve
-            sys_key = eid
-            if sys_key in system_curves:
-                Qs_arr, hs_arr = system_curves[sys_key]
-                Qs_Ls = Qs_arr * 1000.0
-                line_sys, = ax.plot(Qs_Ls, hs_arr, color=BLUE, lw=2.0,
-                                    linestyle="--", label="System curve")
-                legend_handles.append(line_sys)
-
-            # Operating point
-            if eid in self._result.flows:
-                Q_op  = abs(self._result.flows[eid])
-                hp_op = abs(pump_comp.compute_pump_head(Q_op))
+            # ── Single-pump operating point (only when group is single) ───────
+            if cfg == "single" and eid in self._result.flows:
+                Q_op    = abs(self._result.flows[eid])
+                hp_op   = abs(pump_comp.compute_pump_head(Q_op))
                 Q_op_Ls = Q_op * 1000.0
                 ax.scatter([Q_op_Ls], [hp_op], color=GRN, s=80, zorder=5,
                            edgecolors="white", linewidths=1.5)
+                x_off = max(Q_Ls) * 0.05 if len(Q_Ls) else 0.05
+                y_off = max(hp_arr) * 0.05 if len(hp_arr) else 0.5
                 ax.annotate(
                     f" Operating point\n Q = {Q_op_Ls:.2f} L/s\n h = {hp_op:.2f} m",
                     xy=(Q_op_Ls, hp_op),
-                    xytext=(Q_op_Ls + max(Q_Ls)*0.05, hp_op + max(hp_arr)*0.05),
+                    xytext=(Q_op_Ls + x_off, hp_op + y_off),
                     fontsize=7.5, color=FG,
                     arrowprops=dict(arrowstyle="->", color=GRN, lw=1.2),
                 )
-                op_patch = mpatches.Patch(color=GRN, label="Operating point")
-                legend_handles.append(op_patch)
+                if not op_patch_added:
+                    op_patch = mpatches.Patch(color=GRN, label="Operating point")
+                    legend_handles.append(op_patch)
+                    op_patch_added = True
 
+        # ── Standalone system curve (no pumps in network) ─────────────────────
+        if "__standalone__" in system_curves and not pump_edges:
+            Qs_arr, hs_arr = system_curves["__standalone__"]
+            Qs_Ls = Qs_arr * 1000.0
+            line_sys, = ax.plot(Qs_Ls, hs_arr, color=BLUE, lw=2.0,
+                                linestyle="--", label="System curve")
+            legend_handles.append(line_sys)
+
+            # Mark the natural-flow operating point (h_sys = 0 crossing)
+            zero_crossings = np.where(np.diff(np.sign(hs_arr)))[0]
+            if len(zero_crossings):
+                idx = zero_crossings[0]
+                h0, h1 = hs_arr[idx], hs_arr[idx + 1]
+                q0, q1 = Qs_Ls[idx], Qs_Ls[idx + 1]
+                Q_cross = q0 - h0 * (q1 - q0) / (h1 - h0) if h1 != h0 else q0
+                ax.axvline(Q_cross, color=GREY, lw=1.0, linestyle=":", alpha=0.7)
+                ax.annotate(
+                    f" Natural flow\n Q = {Q_cross:.2f} L/s",
+                    xy=(Q_cross, 0),
+                    xytext=(Q_cross + (Qs_Ls[-1] - Qs_Ls[0]) * 0.05,
+                            max(hs_arr) * 0.15 if max(hs_arr) != 0 else 0.5),
+                    fontsize=7.5, color=GREY,
+                    arrowprops=dict(arrowstyle="->", color=GREY, lw=1.0),
+                )
+
+        title = "Pump Curve & System Curve" if has_on_pump else "System Curve"
         ax.set_xlabel("Flow rate Q  [L/s]", color=FG, fontsize=9)
         ax.set_ylabel("Head  h  [m]", color=FG, fontsize=9)
-        ax.set_title("Pump Curve & System Curve", color=FG,
-                     fontweight="bold", fontsize=10)
+        ax.set_title(title, color=FG, fontweight="bold", fontsize=10)
         ax.tick_params(colors=GREY, labelsize=8)
         for spine in ax.spines.values():
             spine.set_edgecolor("#cccccc")
@@ -290,7 +395,6 @@ class PlottingWidget(QWidget):
                       framealpha=0.9, loc="upper right")
 
         ax.set_xlim(left=0)
-        ax.set_ylim(bottom=0)
         self._pump_fig.patch.set_facecolor(BG)
         self._pump_canvas.draw()
 

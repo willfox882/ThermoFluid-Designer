@@ -13,6 +13,17 @@ VISCOSITY    = 1.002e-3    # Pa·s  (dynamic)
 KIN_VISC     = VISCOSITY / DENSITY   # m²/s  (kinematic)
 GRAVITY      = 9.81        # m/s²
 SPEC_WEIGHT  = DENSITY * GRAVITY     # N/m³  (γ = ρg)
+VAPOR_PRESSURE = 2338.0    # Pa (at 20°C)
+
+def get_vapor_pressure(temp_c: float = 20.0) -> float:
+    """
+    Approximate vapor pressure of water [Pa].
+    Antoine equation coefficients for water (range 1-100°C):
+    A=8.07131, B=1730.63, C=233.426 (for P in mmHg, T in °C)
+    """
+    import math
+    p_mmhg = 10**(8.07131 - 1730.63 / (temp_c + 233.426))
+    return p_mmhg * 133.322  # Convert to Pa
 
 # ── Reynolds regime boundaries ────────────────────────────────────────────────
 RE_LAMINAR     = 2300.0

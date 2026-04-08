@@ -26,7 +26,7 @@ from typing import List, Optional
 import numpy as np
 
 from fluid_props import (
-    DENSITY, VISCOSITY, GRAVITY,
+    DENSITY, VISCOSITY, GRAVITY, VAPOR_PRESSURE,
     DEFAULT_ROUGHNESS, DEFAULT_MATERIAL, DEFAULT_CONDITION,
     friction_factor, reynolds_number,
     lookup_roughness, lookup_fitting_k,
@@ -324,17 +324,34 @@ class Pump(FluidComponent):
                  C: float        = 25.0,
                  diameter: float = 0.1,
                  is_on: bool     = True,
+                 desired_flow_rate: float = 0.001,
+                 npsh_required: float     = 2.0,
                  name: str       = ""):
         super().__init__(component_id, name)
-        self.A        = A
-        self.B        = B
-        self.C        = C
-        self.diameter = diameter
-        self.is_on    = is_on
+        self.A                 = A
+        self.B                 = B
+        self.C                 = C
+        self.diameter          = diameter
+        self.is_on             = is_on
+        self.desired_flow_rate = desired_flow_rate   # [m³/s]  used for power estimate
+        self.npsh_required     = npsh_required       # [m]  NPSHr from manufacturer
+        self.npsh_available: float = 0.0
+        self.is_cavitating:  bool  = False
 
     @property
     def area(self) -> float:
         return math.pi * self.diameter**2 / 4.0
+
+    def compute_npsha(self, P_suction: float, V_suction: float) -> float:
+        """
+        Available Net Positive Suction Head (NPSHa).
+        NPSHa = (P_suction - P_vapor) / (rho * g) + V_suction^2 / (2 * g)
+        """
+        head_static = (P_suction - VAPOR_PRESSURE) / (DENSITY * GRAVITY)
+        head_vel    = V_suction**2 / (2.0 * GRAVITY)
+        self.npsh_available = head_static + head_vel
+        self.is_cavitating  = self.npsh_available < self.npsh_required
+        return self.npsh_available
 
     def compute_pump_head(self, Q: float) -> float:
         if not self.is_on:
@@ -385,30 +402,36 @@ class Pump(FluidComponent):
             errs.append(f"[{self.id}] diameter must be > 0 m (got {self.diameter})")
         if self.A > 0:
             errs.append(f"[{self.id}] curve coeff A should be ≤ 0 for stable operation")
+        if self.npsh_required < 0:
+            errs.append(f"[{self.id}] NPSHr must be ≥ 0 (got {self.npsh_required})")
         return errs
 
     def to_dict(self) -> dict:
         return {
-            "type":     "Pump",
-            "id":       self.id,
-            "name":     self.name,
-            "A":        self.A,
-            "B":        self.B,
-            "C":        self.C,
-            "diameter": self.diameter,
-            "is_on":    self.is_on,
+            "type":              "Pump",
+            "id":                self.id,
+            "name":              self.name,
+            "A":                 self.A,
+            "B":                 self.B,
+            "C":                 self.C,
+            "diameter":          self.diameter,
+            "is_on":             self.is_on,
+            "desired_flow_rate": self.desired_flow_rate,
+            "npsh_required":     self.npsh_required,
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "Pump":
         return cls(
-            component_id = d["id"],
-            A            = d.get("A", -8000.0),
-            B            = d.get("B", 0.0),
-            C            = d.get("C", 25.0),
-            diameter     = d.get("diameter", 0.1),
-            is_on        = d.get("is_on", True),
-            name         = d.get("name", d["id"]),
+            component_id       = d["id"],
+            A                  = d.get("A", -8000.0),
+            B                  = d.get("B", 0.0),
+            C                  = d.get("C", 25.0),
+            diameter           = d.get("diameter", 0.1),
+            is_on              = d.get("is_on", True),
+            desired_flow_rate  = d.get("desired_flow_rate", 0.001),
+            npsh_required      = d.get("npsh_required", 2.0),
+            name               = d.get("name", d["id"]),
         )
 
 
@@ -729,16 +752,170 @@ class Reservoir(FluidComponent):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# PressurizedSource  (fixed-head boundary with explicit pressure)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PressurizedSource(Reservoir):
+    """
+    Pressurized source boundary node.
+
+    Behaves identically to a Reservoir (fixed-head boundary condition) but is
+    labelled distinctly in the UI to indicate it represents a pressurized
+    supply line or closed tank rather than an open-surface reservoir.
+
+    Total head:  H = elevation + surface_pressure_Pa / (ρ·g)
+
+    Optional known_flow_rate
+    ────────────────────────
+    If known_flow_rate > 0, the node switches from a fixed-head boundary to a
+    fixed-flow injection boundary (the solver treats it as a Junction with
+    demand = −known_flow_rate).  This is useful when the supply line has a
+    metered flow rate that is known independently of system pressure.
+    """
+
+    def __init__(self, *args, known_flow_rate: float = 0.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.known_flow_rate: float = known_flow_rate   # [m³/s]; 0 = pressure BC
+
+    def to_dict(self) -> dict:
+        d = super().to_dict()
+        d["type"]             = "PressurizedSource"
+        d["known_flow_rate"]  = self.known_flow_rate
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PressurizedSource":
+        kwargs = dict(known_flow_rate=d.get("known_flow_rate", 0.0))
+        if "elevation" in d:
+            return cls(
+                component_id        = d["id"],
+                elevation           = d["elevation"],
+                surface_pressure_Pa = d.get("surface_pressure_Pa", 0.0),
+                name                = d.get("name", d["id"]),
+                **kwargs,
+            )
+        return cls(
+            component_id = d["id"],
+            total_head   = d.get("total_head", 10.0),
+            name         = d.get("name", d["id"]),
+            **kwargs,
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PRV  (Pressure-Reducing Valve)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class PRV(FluidComponent):
+    """
+    Pressure-Reducing Valve edge component.
+
+    Maintains downstream pressure at ``setpoint_Pa``.  The head-loss model
+    used here is a Cv-based hydraulic resistance:
+
+        h_loss = sign(Q) · Q² / (Cv² · g)      [m]
+
+    where Cv is in SI units (m³/s per Pa^0.5).  When the upstream pressure
+    exceeds the setpoint the PRV throttles; this is captured in the solver by
+    a higher effective head loss.  Full active-setpoint enforcement requires a
+    dedicated solver constraint (future work — currently the PRV acts as a
+    variable-resistance valve whose Cv can be adjusted interactively).
+
+    Properties
+    ──────────
+    setpoint_Pa : downstream pressure setpoint [Pa]
+    Cv          : flow coefficient [m³/s / Pa^0.5]  (default 1e-4 ≈ typical ½″ PRV)
+    max_flow    : maximum rated flow [m³/s]
+    diameter    : nominal bore [m]
+    """
+
+    def __init__(self,
+                 component_id: str,
+                 diameter:    float = 0.05,
+                 setpoint_Pa: float = 200_000.0,
+                 Cv:          float = 1e-4,
+                 max_flow:    float = 0.005,
+                 name:        str   = ""):
+        super().__init__(component_id, name)
+        self.diameter    = diameter
+        self.setpoint_Pa = setpoint_Pa
+        self.Cv          = Cv
+        self.max_flow    = max_flow
+
+    @property
+    def area(self) -> float:
+        return math.pi * self.diameter ** 2 / 4.0
+
+    @property
+    def setpoint_head(self) -> float:
+        return self.setpoint_Pa / (DENSITY * GRAVITY)
+
+    def compute_head_loss(self, Q: float) -> float:
+        if abs(Q) < 1e-14:
+            return 0.0
+        # h = Q² / (Cv² · g)
+        h = Q ** 2 / (self.Cv ** 2 * GRAVITY)
+        return math.copysign(1.0, Q) * h
+
+    def dhead_loss_dQ(self, Q: float, eps: float = 1e-8) -> float:
+        if abs(Q) < 1e-10:
+            return 2.0 * eps / (self.Cv ** 2 * GRAVITY)
+        return 2.0 * abs(Q) / (self.Cv ** 2 * GRAVITY)
+
+    def compute_reynolds(self, Q: float) -> float:
+        if abs(Q) < 1e-14:
+            return 0.0
+        return reynolds_number(abs(Q) / self.area, self.diameter)
+
+    def compute_friction_factor(self, Q: float) -> float:
+        return 0.0
+
+    def validate(self) -> List[str]:
+        errs = []
+        if self.setpoint_Pa < 0:
+            errs.append(f"[{self.id}] setpoint_Pa must be ≥ 0 (got {self.setpoint_Pa})")
+        if self.diameter <= 0:
+            errs.append(f"[{self.id}] diameter must be > 0 m (got {self.diameter})")
+        if self.Cv <= 0:
+            errs.append(f"[{self.id}] Cv must be > 0 (got {self.Cv})")
+        return errs
+
+    def to_dict(self) -> dict:
+        return {
+            "type":        "PRV",
+            "id":          self.id,
+            "name":        self.name,
+            "diameter":    self.diameter,
+            "setpoint_Pa": self.setpoint_Pa,
+            "Cv":          self.Cv,
+            "max_flow":    self.max_flow,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PRV":
+        return cls(
+            component_id = d["id"],
+            diameter     = d.get("diameter", 0.05),
+            setpoint_Pa  = d.get("setpoint_Pa", 200_000.0),
+            Cv           = d.get("Cv", 1e-4),
+            max_flow     = d.get("max_flow", 0.005),
+            name         = d.get("name", d["id"]),
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Factory helper
 # ═══════════════════════════════════════════════════════════════════════════════
 
 _COMPONENT_REGISTRY = {
-    "Pipe":      Pipe,
-    "Pump":      Pump,
-    "Valve":     Valve,
-    "Fitting":   Fitting,
-    "Junction":  Junction,
-    "Reservoir": Reservoir,
+    "Pipe":              Pipe,
+    "Pump":              Pump,
+    "Valve":             Valve,
+    "PRV":               PRV,
+    "Fitting":           Fitting,
+    "Junction":          Junction,
+    "Reservoir":         Reservoir,
+    "PressurizedSource": PressurizedSource,
 }
 
 def component_from_dict(d: dict) -> FluidComponent:
@@ -748,5 +925,5 @@ def component_from_dict(d: dict) -> FluidComponent:
         raise ValueError(f"Unknown component type: {kind!r}")
     return cls.from_dict(d)
 
-EDGE_COMPONENT_TYPES = {"Pipe", "Pump", "Valve", "Fitting"}
-NODE_COMPONENT_TYPES = {"Junction", "Reservoir"}
+EDGE_COMPONENT_TYPES = {"Pipe", "Pump", "Valve", "Fitting", "PRV"}
+NODE_COMPONENT_TYPES = {"Junction", "Reservoir", "PressurizedSource"}

@@ -38,7 +38,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 
 from components import (
-    FluidComponent, Junction, Reservoir, Pipe, Pump, Valve, Fitting,
+    FluidComponent, Junction, Reservoir, PressurizedSource,
+    Pipe, Pump, Valve, PRV, Fitting,
     FittingAttachment,
     component_from_dict, EDGE_COMPONENT_TYPES, NODE_COMPONENT_TYPES,
 )
@@ -53,9 +54,16 @@ class NetworkNode:
     connected_edge_ids: List[str] = field(default_factory=list)
 
     def is_reservoir(self) -> bool:
+        # A PressurizedSource with a known_flow_rate switches to a free-head
+        # (junction) boundary, so it must NOT be treated as a fixed-head reservoir.
+        if isinstance(self.component, PressurizedSource):
+            return getattr(self.component, 'known_flow_rate', 0.0) <= 0
         return isinstance(self.component, Reservoir)
 
     def is_junction(self) -> bool:
+        # PressurizedSource with known_flow_rate > 0 acts as a fixed-injection node.
+        if isinstance(self.component, PressurizedSource):
+            return getattr(self.component, 'known_flow_rate', 0.0) > 0
         return isinstance(self.component, Junction)
 
 

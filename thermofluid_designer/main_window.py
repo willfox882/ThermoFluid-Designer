@@ -30,7 +30,7 @@ from PyQt6.QtGui import QAction, QIcon, QKeySequence, QFont, QColor, QUndoStack,
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from components import (
-    Pipe, Pump, Valve, Fitting, Junction, Reservoir,
+    Pipe, Pump, Valve, Fitting, Junction, Reservoir, PressurizedSource,
     FittingAttachment, component_from_dict,
 )
 from network import PipeNetwork
@@ -38,7 +38,7 @@ from solver import NetworkSolver, SolverResult
 from canvas import (
     ThermofluidCanvas, ThermofluidView, CanvasSignals,
     NodeGraphicsItem, EdgeGraphicsItem, InlineComponentItem, PortItem,
-    PipeEdgeItem,
+    PipeEdgeItem, FittingIconItem,
 )
 from sidebar import PropertiesPanel
 from plotting_widget import PlottingWidget
@@ -54,7 +54,10 @@ LOAD_DEMO_ON_START: bool = os.environ.get("LOAD_DEMO_ON_START", "0") == "1"
 # ── Tooltip builder ────────────────────────────────────────────────────────────
 
 def _component_tooltip(comp) -> str:
-    if isinstance(comp, Reservoir):
+    if isinstance(comp, PressurizedSource):
+        return (f"Pressurized Source: {comp.name}\nH = {comp.total_head:.3f} m\n"
+                f"z = {comp.elevation:.3f} m\nP_supply = {comp.surface_pressure_Pa:.0f} Pa")
+    elif isinstance(comp, Reservoir):
         return (f"Reservoir: {comp.name}\nH = {comp.total_head:.3f} m\n"
                 f"z = {comp.elevation:.3f} m\nP_surface = {comp.surface_pressure_Pa:.0f} Pa")
     elif isinstance(comp, Junction):
@@ -496,7 +499,9 @@ class MainWindow(QMainWindow):
         self._dirty        = False
 
         self._counters = {k: 0 for k in
-                          ("reservoir", "junction", "pipe", "pump", "valve", "fitting")}
+                          ("reservoir", "junction", "pipe", "pump", "valve", "fitting",
+                           "pressurized_source")}
+        self._last_system_curves: dict = {}   # populated after each successful solve
 
         # Pipe connection mode state
         self._pending_edge_type: Optional[str] = None
@@ -614,8 +619,9 @@ class MainWindow(QMainWindow):
             return act
 
         # Node placement
-        btn("⬡ Reservoir", "Place reservoir (fixed head)",    self._place_reservoir)
-        btn("● Junction",  "Place junction node",             self._place_junction)
+        btn("⬡ Reservoir",        "Place reservoir (fixed head)",          self._place_reservoir)
+        btn("⬡ Press. Source",    "Place pressurized source (fixed head)", self._place_pressurized_source)
+        btn("● Junction",         "Place junction node",                   self._place_junction)
         tb.addSeparator()
 
         # Pipe: click-to-connect between two nodes/ports
@@ -666,6 +672,7 @@ class MainWindow(QMainWindow):
         s.fitting_placement_requested.connect(self._on_fitting_placement_requested)
         s.move_finished.connect(self._on_move_finished)
         s.inline_move_finished.connect(self._on_inline_move_finished)
+        s.escape_pressed.connect(self._cancel_all_modes)
 
         self._view.placement_requested.connect(self._on_place_component)
         self._sidebar.apply_requested.connect(self._on_properties_apply)
@@ -679,12 +686,20 @@ class MainWindow(QMainWindow):
         self._view.set_placement_mode("reservoir")
         self._status_net.setText("  Click canvas to place Reservoir")
 
+    def _place_pressurized_source(self):
+        self._cancel_all_modes()
+        self._view.set_placement_mode("pressurized_source")
+        self._status_net.setText("  Click canvas to place Pressurized Source")
+
     def _place_junction(self):
         self._cancel_all_modes()
         self._view.set_placement_mode("junction")
         self._status_net.setText("  Click canvas to place Junction")
 
     def _connect_pipe(self):
+        if self._connect_mode_active:
+            self._cancel_all_modes()
+            return
         self._cancel_all_modes()
         self._pending_edge_type   = "pipe"
         self._connect_mode_active = True
@@ -694,18 +709,27 @@ class MainWindow(QMainWindow):
         self._status_net.setText("  [Pipe] Click SOURCE node or port…")
 
     def _place_pump_mode(self):
+        if self._view._placement_mode == "pump":
+            self._cancel_all_modes()
+            return
         self._cancel_all_modes()
         self._view.set_placement_mode("pump")
         self._act_pump.setChecked(True)
         self._status_net.setText("  Click canvas to place Pump")
 
     def _place_valve_mode(self):
+        if self._view._placement_mode == "valve":
+            self._cancel_all_modes()
+            return
         self._cancel_all_modes()
         self._view.set_placement_mode("valve")
         self._act_valve.setChecked(True)
         self._status_net.setText("  Click canvas to place Valve")
 
     def _fitting_attach_mode(self):
+        if self._fitting_mode_active:
+            self._cancel_all_modes()
+            return
         self._cancel_all_modes()
         self._fitting_mode_active = True
         self._act_fitting.setChecked(True)
@@ -730,7 +754,7 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str, float, float)
     def _on_place_component(self, comp_type: str, x: float, y: float):
         """Called when user clicks canvas during placement mode."""
-        if comp_type in ("reservoir", "junction"):
+        if comp_type in ("reservoir", "junction", "pressurized_source"):
             self._add_node_to_network(comp_type, x, y)
         elif comp_type in ("pump", "valve"):
             self._add_inline_component(comp_type, x, y)
@@ -742,11 +766,16 @@ class MainWindow(QMainWindow):
     def _add_node_to_network(self, comp_type: str, x: float, y: float) -> Optional[str]:
         self._counters[comp_type] += 1
         n      = self._counters[comp_type]
-        prefix = {"reservoir": "R", "junction": "J"}
+        prefix = {"reservoir": "R", "junction": "J", "pressurized_source": "PS"}
         comp_id = f"{prefix[comp_type]}{n}"
 
         if comp_type == "reservoir":
             comp = Reservoir(comp_id, total_head=15.0)
+        elif comp_type == "pressurized_source":
+            comp = PressurizedSource(comp_id,
+                                     elevation=0.0,
+                                     surface_pressure_Pa=150000.0,  # 1.5 bar gauge default
+                                     name=f"Press.Source {n}")
         else:
             comp = Junction(comp_id, elevation=0.0, demand=0.0)
 
@@ -936,15 +965,64 @@ class MainWindow(QMainWindow):
         self._right_tabs.setCurrentIndex(0)
 
         if self._last_result and self._last_result.converged:
-            self._sidebar.show_results({
+            result_dict = {
                 "flow":            self._last_result.flows.get(edge_id),
                 "velocity":        self._last_result.velocities.get(edge_id),
                 "head_loss":       self._last_result.head_losses.get(edge_id),
                 "reynolds":        self._last_result.reynolds.get(edge_id),
                 "friction_factor": self._last_result.friction_factors.get(edge_id),
-            })
+            }
+            if isinstance(comp, Pump):
+                result_dict["npsh_available"] = comp.npsh_available
+                result_dict["is_cavitating"]  = comp.is_cavitating
+            # Compute required pump head + power at desired flow rate
+            if isinstance(comp, Pump) and self._last_system_curves:
+                h_req, P_kW = self._compute_pump_sizing(comp, edge_id)
+                if h_req is not None:
+                    result_dict["pump_req_head"] = h_req
+                if P_kW is not None:
+                    result_dict["pump_power"] = P_kW
+            self._sidebar.show_results(result_dict)
         else:
             self._sidebar.hide_results()
+
+    def _compute_pump_sizing(self, comp: Pump, edge_id: str
+                            ) -> tuple:
+        """
+        Compute required pump head and hydraulic power at the pump's
+        desired_flow_rate using the stored system curve.
+
+            h_req = h_system(Q_des)
+            P_req = ρ · g · Q_des · h_req   [W]  → returned in kW
+
+        Returns (h_req [m], P_req [kW]).  Either value may be None if data
+        are insufficient or if the system curve indicates no pump work is
+        needed (gravity/pressure drives the flow at Q_des).
+        """
+        from fluid_props import DENSITY, GRAVITY
+        import numpy as np
+
+        Q_des = comp.desired_flow_rate   # [m³/s]
+        if Q_des <= 0:
+            return None, None
+
+        sc = (self._last_system_curves.get(edge_id)
+              or self._last_system_curves.get("__standalone__"))
+        if sc is None:
+            return None, None
+
+        Q_arr, h_arr = sc
+        if len(Q_arr) < 2:
+            return None, None
+
+        h_req = float(np.interp(Q_des, Q_arr, h_arr))
+
+        if h_req <= 0:
+            # Gravity / upstream pressure provides sufficient head — no pump needed
+            return h_req, None
+
+        P_kW = DENSITY * GRAVITY * Q_des * h_req / 1000.0
+        return h_req, P_kW
 
     @pyqtSlot()
     def _on_nothing_selected(self):
@@ -1029,7 +1107,8 @@ class MainWindow(QMainWindow):
 
         self._sync_canvas_item(comp_id)
         self._mark_dirty()
-        self._last_result = None
+        self._last_result        = None
+        self._last_system_curves = {}
         self._scene.clear_results()
         self._sidebar.hide_results()
         self._status_solver.setText("Solver: — (modified, re-solve needed)")
@@ -1058,51 +1137,110 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _on_solve(self):
-        self._status_solver.setText("Solver: running…")
-        QApplication.processEvents()
+        try:
+            self._status_solver.setText("Solver: running…")
+            QApplication.processEvents()
 
-        solver = NetworkSolver(self._network)
-        result = solver.solve(tol=1e-9, max_iter=200)
-        self._last_result = result
+            solver = NetworkSolver(self._network)
+            result = solver.solve(tol=1e-9, max_iter=200)
+            self._last_result = result
 
-        if not result.converged and result.errors:
-            self._sidebar.show_validation_error(result.errors)
-            self._status_solver.setText(
-                f"Solver: ✗ validation failed ({len(result.errors)} errors)")
-            self._status_solver.setStyleSheet("color:#e04040;")
-            self._refresh_status()
-            return
+            if not result.converged and result.errors:
+                self._sidebar.show_validation_error(result.errors)
+                self._status_solver.setText(
+                    f"Solver: ✗ validation failed ({len(result.errors)} errors)")
+                self._status_solver.setStyleSheet("color:#e04040;")
+                self._refresh_status()
+                return
 
-        if result.converged:
-            self._status_solver.setText(
-                f"Solver: ✓ converged  (residual = {result.residual_norm:.2e})")
-            self._status_solver.setStyleSheet("color:#50cc80;")
-        else:
-            self._status_solver.setText(
-                f"Solver: ⚠ did not converge  (residual = {result.residual_norm:.2e})")
-            self._status_solver.setStyleSheet("color:#e07030;")
+            if result.converged:
+                # Check for cavitation warnings specifically
+                cavitating_pumps = [e.component.id for e in self._network.get_pumps()
+                                    if e.component.is_on and e.component.is_cavitating]
+                if cavitating_pumps:
+                    self._status_solver.setText(
+                        f"Solver: ✓ converged (⚠ CAVITATION in {len(cavitating_pumps)} pumps)")
+                    self._status_solver.setStyleSheet("color:#e0a030; font-weight:bold;")
+                else:
+                    self._status_solver.setText(
+                        f"Solver: ✓ converged  (residual = {result.residual_norm:.2e})")
+                    self._status_solver.setStyleSheet("color:#50cc80;")
+            else:
+                self._status_solver.setText(
+                    f"Solver: ⚠ did not converge  (residual = {result.residual_norm:.2e})")
+                self._status_solver.setStyleSheet("color:#e07030;")
 
-        elevations = {nid: node.component.elevation
-                      for nid, node in self._network.nodes.items()
-                      if isinstance(node.component, Reservoir)}
-        self._scene.apply_results(result.heads, result.flows, elevations)
+            # ... rest of results processing ...
+            elevations = {nid: node.component.elevation
+                          for nid, node in self._network.nodes.items()
+                          if isinstance(node.component, Reservoir)}
+            self._scene.apply_results(result.heads, result.flows, elevations)
 
-        system_curves = {}
-        for pump_edge in self._network.get_pumps():
-            eid = pump_edge.edge_id
-            Q_arr, h_arr = solver.compute_system_curve(eid, result)
-            if len(Q_arr):
-                system_curves[eid] = (Q_arr, h_arr)
+            system_curves = {}
+            all_pumps = self._network.get_pumps()
 
-        self._plotter.update_results(self._network, result, system_curves)
-        self._right_tabs.setCurrentIndex(1)
+            # Compute system curve for EVERY pump, regardless of on/off state.
+            # The system curve is a property of the network, not the pump.
+            for pump_edge in all_pumps:
+                eid = pump_edge.edge_id
+                Q_arr, h_arr = solver.compute_system_curve(eid, result)
+                if len(Q_arr):
+                    system_curves[eid] = (Q_arr, h_arr)
 
-        errs = self._network.validate()
-        self._sidebar.show_validation_error(errs)
+            # Standalone curve only when the network has no pumps at all
+            if not all_pumps:
+                Q_sa, h_sa = solver.compute_system_curve_standalone(result)
+                if len(Q_sa):
+                    system_curves["__standalone__"] = (Q_sa, h_sa)
+
+            self._last_system_curves = system_curves
+
+            # ── Multi-pump: detect topology groups + build combined curves ────────
+            pump_groups = solver.detect_pump_groups()
+            for grp in pump_groups:
+                cfg      = grp["type"]
+                pids     = grp["pump_ids"]
+                grp["on_pumps"] = [pid for pid in pids
+                                    if self._network.edges[pid].component.is_on]
+                if cfg in ("series", "parallel") and len(grp["on_pumps"]) >= 2:
+                    cQ, ch = solver.compute_combined_pump_curve(pids, cfg)
+                    grp["combined_Q"] = cQ
+                    grp["combined_h"] = ch
+
+                    # Find operating point: intersection of combined curve + system curve
+                    ref_pid = pids[0]
+                    if ref_pid in system_curves:
+                        sQ, sh = system_curves[ref_pid]
+                        pt = solver.find_curve_intersection(cQ, ch, sQ, sh)
+                        grp["op_point"] = pt   # (Q, h) or None
+                    else:
+                        grp["op_point"] = None
+                else:
+                    grp["combined_Q"] = None
+                    grp["combined_h"] = None
+                    grp["op_point"]   = None
+
+            self._plotter.update_results(self._network, result, system_curves,
+                                         pump_groups)
+            self._right_tabs.setCurrentIndex(1)
+
+            errs = self._network.validate()
+            if result.errors: # Include cavitation warnings from solver
+                errs.extend([e for e in result.errors if "CAVITATION" in e])
+            self._sidebar.show_validation_error(errs)
+
+        except Exception as e:
+            self._status_solver.setText("Solver: CRASHED")
+            self._status_solver.setStyleSheet("color:#e04040; font-weight:bold;")
+            QMessageBox.critical(self, "Simulation Error",
+                                 f"An unexpected error occurred during simulation:\n\n{str(e)}")
+            import traceback
+            traceback.print_exc()
 
     @pyqtSlot()
     def _on_clear_results(self):
         self._last_result = None
+        self._last_system_curves = {}
         self._scene.clear_results()
         self._plotter.clear()
         self._sidebar.hide_results()
@@ -1172,7 +1310,8 @@ class MainWindow(QMainWindow):
         self._scene._draw_grid()
 
         self._counters = {k: 0 for k in self._counters}
-        self._last_result  = None
+        self._last_result       = None
+        self._last_system_curves = {}
         self._current_file = None
         self._dirty        = False
         self._undo_stack.clear()
@@ -1340,18 +1479,21 @@ class MainWindow(QMainWindow):
         if key == Qt.Key.Key_Delete:
             sel = self._scene.selectedItems()
             if sel:
-                item = sel[0]
-                if isinstance(item, PortItem):
-                    # Delete the parent inline component
-                    parent = item.parentItem()
-                    if isinstance(parent, InlineComponentItem):
-                        self._on_delete_requested(parent.component_edge_id)
-                elif isinstance(item, InlineComponentItem):
-                    self._on_delete_requested(item.component_edge_id)
-                elif isinstance(item, NodeGraphicsItem):
-                    self._on_delete_requested(item.node_id)
-                elif isinstance(item, EdgeGraphicsItem):
-                    self._on_delete_requested(item.edge_id)
+                # Loop through all selected items instead of just the first one
+                for item in list(sel):
+                    if isinstance(item, PortItem):
+                        parent = item.parentItem()
+                        if isinstance(parent, InlineComponentItem):
+                            self._on_delete_requested(parent.component_edge_id)
+                    elif isinstance(item, InlineComponentItem):
+                        self._on_delete_requested(item.component_edge_id)
+                    elif isinstance(item, NodeGraphicsItem):
+                        self._on_delete_requested(item.node_id)
+                    elif isinstance(item, EdgeGraphicsItem):
+                        self._on_delete_requested(item.edge_id)
+                    elif isinstance(item, FittingIconItem):
+                        # Handle direct deletion of fitting icons
+                        self._on_delete_requested(f"fitting::{item.pipe_edge_id}::{item.fitting_id}")
             return
 
         if key == Qt.Key.Key_Escape:

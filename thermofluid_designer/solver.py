@@ -45,6 +45,7 @@ where B[j, node_idx(from)] = +1,  B[j, node_idx(to)] = −1
 
 from __future__ import annotations
 
+import math
 import warnings
 from typing import Dict, List, Optional, Tuple
 
@@ -52,7 +53,7 @@ import numpy as np
 from scipy.optimize import fsolve
 
 from network import PipeNetwork, NetworkEdge
-from components import Junction, Reservoir, Pump
+from components import Junction, Reservoir, Pump, PressurizedSource
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -148,7 +149,14 @@ class NetworkSolver:
 
     def _demand(self, node_id: str) -> float:
         comp = self.network.nodes[node_id].component
-        return comp.demand if isinstance(comp, Junction) else 0.0
+        if isinstance(comp, Junction):
+            return comp.demand
+        # PressurizedSource with a known flow rate acts as a fixed-injection node
+        if isinstance(comp, PressurizedSource):
+            kfr = getattr(comp, 'known_flow_rate', 0.0)
+            if kfr > 0:
+                return -kfr   # negative = injection into the network
+        return 0.0
 
     # ── Residuals ─────────────────────────────────────────────────────────────
 
@@ -359,6 +367,8 @@ class NetworkSolver:
             try:
                 J  = self.jacobian(x)
                 dx = np.linalg.solve(J, -F)
+                # Robustness: clamp Newton step to prevent wild divergence
+                dx = np.clip(dx, -1e3, 1e3)
             except np.linalg.LinAlgError:
                 break
 
@@ -366,6 +376,8 @@ class NetworkSolver:
             alpha = 1.0
             for _ in range(8):
                 x_new  = x + alpha * dx
+                # Prevent negative flows/heads from causing math errors in residuals
+                # (especially for friction factor log calculations)
                 F_new  = self.residuals(x_new)
                 nfev  += 1
                 if np.linalg.norm(F_new) < norm:
@@ -413,71 +425,457 @@ class NetworkSolver:
             result.friction_factors[eid] = comp.compute_friction_factor(Q)
 
             A = getattr(comp, "area", None)
-            result.velocities[eid] = (Q / A) if (A and A > 0) else 0.0
+            V = (Q / A) if (A and A > 0) else 0.0
+            result.velocities[eid] = V
+
+        # 5. POST-SOLVE: NPSH and Cavitation checks
+        for eid, edge in self.network.edges.items():
+            comp = edge.component
+            if isinstance(comp, Pump) and comp.is_on:
+                P_suc = result.pressures.get(edge.from_node_id, 0.0)
+                V_suc = result.velocities.get(eid, 0.0)
+                comp.compute_npsha(P_suc, V_suc)
+                if comp.is_cavitating:
+                    result.errors.append(f"CAVITATION WARNING: Pump {comp.id} "
+                                         f"NPSHa ({comp.npsh_available:.2f} m) < "
+                                         f"NPSHr ({comp.npsh_required:.2f} m)")
 
         return result
 
     # ── System curve computation ───────────────────────────────────────────────
 
+    def _find_reservoir_pair(self, pump_edge_id: str) -> Tuple[float, float]:
+        """
+        BFS from each side of a pump edge to locate the supply (suction-side)
+        and delivery (discharge-side) reservoir total heads.
+
+        Returns (H_source, H_delivery).
+        Fallback: if one side finds no reservoir, uses global min/max.
+        """
+        pump_edge = self.network.edges.get(pump_edge_id)
+        if pump_edge is None:
+            return 0.0, 0.0
+
+        def bfs_head(start_id: str) -> Optional[float]:
+            visited = {start_id}
+            queue   = [start_id]
+            while queue:
+                nid  = queue.pop(0)
+                node = self.network.nodes.get(nid)
+                if node is None:
+                    continue
+                if isinstance(node.component, Reservoir):
+                    return node.component.total_head
+                for eid in node.connected_edge_ids:
+                    if eid == pump_edge_id:
+                        continue          # do not cross the pump itself
+                    edge = self.network.edges.get(eid)
+                    if edge is None:
+                        continue
+                    fn, tn = edge.from_node_id, edge.to_node_id
+                    nbr = tn if fn == nid else fn
+                    if nbr not in visited:
+                        visited.add(nbr)
+                        queue.append(nbr)
+            return None
+
+        H_src = bfs_head(pump_edge.from_node_id)
+        H_del = bfs_head(pump_edge.to_node_id)
+
+        # Fallback: use global min / max reservoir heads
+        reservoirs = self.network.get_reservoir_nodes()
+        if reservoirs:
+            hs = sorted(r.component.total_head for r in reservoirs)
+            if H_src is None:
+                H_src = hs[0]
+            if H_del is None:
+                H_del = hs[-1]
+
+        return (H_src or 0.0), (H_del or 0.0)
+
     def compute_system_curve(self,
                              pump_edge_id:  str,
-                             last_result:   SolverResult,
+                             last_result:   Optional[SolverResult] = None,
                              n_points:      int = 150
                              ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Approximate system curve:  h_system(Q) = h_static + R_eff · Q²
+        Compute system curve  h_system(Q) = h_static + Σ h_loss(Q)
+        by sweeping Q values.
 
-        Method
-        ──────
-        At the operating point (Q*, H*) we know:
-            H* = h_pump(Q*)  →  h_pump(Q*) = h_system(Q*)
+        This method is INDEPENDENT of pump state — identical curve whether
+        the pump is ON or OFF.
 
-        The static head h_static is the elevation/head difference the system
-        must overcome at zero flow.  For a system with source reservoir H_src
-        and sink reservoir H_snk:
-            h_static = H_snk − H_src   (head to be overcome)
+        h_static  = H_delivery − H_source
+                    (BFS from pump ports to nearest reservoir on each side;
+                     > 0 for uphill pumping, < 0 when gravity helps)
 
-        Effective resistance:
-            R_eff = (H* − h_static) / Q*²
+        h_loss(Q) = Σ compute_head_loss(Q) over all non-pump edges
+                    (series network assumption; reasonable approx for parallel)
 
-        System curve (parabola through origin of the friction losses):
-            h_sys(Q) = h_static + R_eff · Q²
-
-        This approximation is valid near the operating point.  It breaks down
-        for highly non-linear networks but is accurate enough for design.
-
-        Returns (Q_array, h_system_array).
+        Returns (Q_arr [m³/s], h_sys_arr [m]).
         """
-        if pump_edge_id not in last_result.flows:
+        if pump_edge_id not in self.network.edges:
             return np.array([]), np.array([])
 
-        Q_star = abs(last_result.flows[pump_edge_id])
-        if Q_star < 1e-10:
+        pump_comp = self.network.edges[pump_edge_id].component
+        if not isinstance(pump_comp, Pump):
             return np.array([]), np.array([])
 
-        # Pump's head at operating point (from energy equation on pump edge)
-        pump_edge  = self.network.edges[pump_edge_id]
-        pump_comp  = pump_edge.component
-        H_pump_star = abs(pump_comp.compute_pump_head(Q_star))
+        H_src, H_del = self._find_reservoir_pair(pump_edge_id)
+        h_static = H_del - H_src   # > 0 for typical uphill pump system
 
-        # Static head: difference between sink and source reservoirs
-        reservoirs = self.network.get_reservoir_nodes()
-        if len(reservoirs) >= 2:
-            heads = sorted([r.component.total_head for r in reservoirs])
-            h_static = max(0.0, heads[-1] - heads[0])
-        else:
-            h_static = 0.0
+        non_pump = [e for e in self.network.edges.values()
+                    if not isinstance(e.component, Pump)]
 
-        # Friction component at operating point
-        h_fric_star = H_pump_star - h_static
-        if h_fric_star < 0:
-            h_fric_star = 0.0
+        # Q range based on pump operating range + desired flow
+        Q_des = max(getattr(pump_comp, 'desired_flow_rate', 0.0), 0.0)
+        _, Q_pump_max = pump_comp.get_operating_range()
+        Q_max = max(Q_pump_max * 1.5, Q_des * 2.0, 0.05)
 
-        R_eff = h_fric_star / Q_star**2
-
-        # Build curve
-        Q_max = Q_star * 1.8
         Q_arr = np.linspace(0.0, Q_max, n_points)
-        h_sys = h_static + R_eff * Q_arr**2
+        h_sys = np.empty(n_points)
+
+        for i, Q in enumerate(Q_arr):
+            if Q < 1e-12:
+                h_sys[i] = h_static
+            else:
+                h_loss = sum(e.component.compute_head_loss(Q) for e in non_pump)
+                h_sys[i] = h_static + h_loss
 
         return Q_arr, h_sys
+
+    def compute_system_curve_standalone(self,
+                                        last_result: Optional[SolverResult] = None,
+                                        n_points:    int = 150
+                                        ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        System curve for networks that contain no pump.
+
+        h_static  = H_outlet − H_inlet
+                    (negative for gravity-driven flow where inlet head > outlet)
+
+        h_loss(Q) = Σ compute_head_loss(Q) over all edges
+
+        Returns (Q_arr, h_sys), or empty arrays if insufficient data.
+        """
+        reservoirs = self.network.get_reservoir_nodes()
+        if len(reservoirs) < 2:
+            return np.array([]), np.array([])
+
+        hs = sorted(r.component.total_head for r in reservoirs)
+        H_src  = hs[-1]     # highest-head reservoir = gravity source
+        H_del  = hs[0]      # lowest-head reservoir = destination
+        h_static = H_del - H_src   # negative for gravity-driven flow
+
+        all_edges = [e for e in self.network.edges.values()
+                     if not isinstance(e.component, Pump)]
+        if not all_edges:
+            return np.array([]), np.array([])
+
+        if last_result and last_result.flows:
+            Q_ref = max(abs(q) for q in last_result.flows.values())
+            Q_max = max(Q_ref * 2.0, 0.01)
+        else:
+            Q_max = 0.05
+
+        Q_arr = np.linspace(0.0, Q_max, n_points)
+        h_sys = np.empty(n_points)
+
+        for i, Q in enumerate(Q_arr):
+            if Q < 1e-12:
+                h_sys[i] = h_static
+            else:
+                h_loss = sum(e.component.compute_head_loss(Q) for e in all_edges)
+                h_sys[i] = h_static + h_loss
+
+        return Q_arr, h_sys
+
+    @staticmethod
+    def generate_pump_curve(Q_des: float, h_req: float,
+                            pump_type: str = "centrifugal"
+                            ) -> Tuple[float, float, float]:
+        """
+        Generate a synthetic quadratic pump curve  h(Q) = H_shutoff − a·Q²
+        whose BEP coincides with (Q_des, h_req).
+
+        Shutoff-head multiplier per pump type:
+          centrifugal  → 1.25 × h_req
+          mixed-flow   → 1.15 × h_req
+          axial        → 1.10 × h_req
+
+        Returns (A, B, C) such that  h_pump = A·Q² + B·Q + C  (A ≤ 0).
+        """
+        if Q_des <= 0 or h_req <= 0:
+            return -8000.0, 0.0, 25.0
+
+        factors = {"centrifugal": 1.25, "mixed-flow": 1.15, "axial": 1.10}
+        shutoff_mult = factors.get(pump_type, 1.25)
+        H_shutoff    = shutoff_mult * h_req
+        a            = (H_shutoff - h_req) / Q_des ** 2   # > 0
+        return -a, 0.0, H_shutoff
+
+    # ── Multi-pump topology + combined curves ─────────────────────────────────
+
+    def _pumps_are_series(self, pid1: str, pid2: str) -> bool:
+        """
+        Return True if pump1_out can reach pump2_in (or vice versa)
+        via BFS across junctions/pipes without crossing a Reservoir or
+        either pump edge itself.
+        """
+        e1 = self.network.edges.get(pid1)
+        e2 = self.network.edges.get(pid2)
+        if e1 is None or e2 is None:
+            return False
+
+        exclude = {pid1, pid2}
+
+        def reachable(start: str, target: str) -> bool:
+            visited = {start}
+            queue   = [start]
+            while queue:
+                nid  = queue.pop(0)
+                if nid == target:
+                    return True
+                node = self.network.nodes.get(nid)
+                if node is None:
+                    continue
+                for eid in node.connected_edge_ids:
+                    if eid in exclude:
+                        continue
+                    edge = self.network.edges.get(eid)
+                    if edge is None:
+                        continue
+                    fn, tn = edge.from_node_id, edge.to_node_id
+                    nbr = tn if fn == nid else fn
+                    if nbr in visited:
+                        continue
+                    nbr_node = self.network.nodes.get(nbr)
+                    if nbr_node and isinstance(nbr_node.component, Reservoir):
+                        continue   # do not traverse through fixed-head boundaries
+                    visited.add(nbr)
+                    queue.append(nbr)
+            return False
+
+        return (reachable(e1.to_node_id,   e2.from_node_id) or
+                reachable(e2.to_node_id,   e1.from_node_id))
+
+    def _pumps_are_parallel(self, pid1: str, pid2: str) -> bool:
+        """
+        Return True if the two pumps share both a common inlet node
+        cluster and a common outlet node cluster (i.e., the flow splits
+        at a junction before the pumps and rejoins after them).
+        """
+        e1 = self.network.edges.get(pid1)
+        e2 = self.network.edges.get(pid2)
+        if e1 is None or e2 is None:
+            return False
+
+        exclude = {pid1, pid2}
+
+        def reachable(start: str, target: str) -> bool:
+            visited = {start}
+            queue   = [start]
+            while queue:
+                nid  = queue.pop(0)
+                if nid == target:
+                    return True
+                node = self.network.nodes.get(nid)
+                if node is None:
+                    continue
+                for eid in node.connected_edge_ids:
+                    if eid in exclude:
+                        continue
+                    edge = self.network.edges.get(eid)
+                    if edge is None:
+                        continue
+                    fn, tn = edge.from_node_id, edge.to_node_id
+                    nbr = tn if fn == nid else fn
+                    if nbr in visited:
+                        continue
+                    nbr_node = self.network.nodes.get(nbr)
+                    if nbr_node and isinstance(nbr_node.component, Reservoir):
+                        continue
+                    visited.add(nbr)
+                    queue.append(nbr)
+            return False
+
+        same_inlet  = (e1.from_node_id == e2.from_node_id or
+                       reachable(e1.from_node_id, e2.from_node_id))
+        same_outlet = (e1.to_node_id == e2.to_node_id or
+                       reachable(e1.to_node_id, e2.to_node_id))
+        return same_inlet and same_outlet
+
+    def detect_pump_groups(self) -> List[Dict]:
+        """
+        Inspect network topology (Option A — canvas-topology-driven) and
+        cluster the pump edges into series / parallel / independent groups.
+
+        A group entry has the shape:
+            {
+              "type":     "series" | "parallel" | "single",
+              "pump_ids": [<edge_id>, ...],
+            }
+
+        Detection rules
+        ───────────────
+        • Two pumps are **series**   if one's outlet-side can reach the
+          other's inlet-side through junctions/pipes without crossing a
+          reservoir or either pump.
+        • Two pumps are **parallel** if they share both an inlet-side
+          junction cluster and an outlet-side junction cluster.
+        • Otherwise they are **independent** (each in its own group).
+        """
+        from typing import Dict as _Dict
+        pump_edges = self.network.get_pumps()
+        if not pump_edges:
+            return []
+        if len(pump_edges) == 1:
+            return [{"type": "single", "pump_ids": [pump_edges[0].edge_id]}]
+
+        # Union-Find for grouping
+        parent: Dict[str, str] = {pe.edge_id: pe.edge_id for pe in pump_edges}
+        config: Dict[str, str] = {}   # edge_id → "series" | "parallel"
+
+        def find(x: str) -> str:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x: str, y: str, cfg: str):
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[ry] = rx
+                config[rx] = cfg
+
+        ids = [pe.edge_id for pe in pump_edges]
+        for i in range(len(ids)):
+            for j in range(i + 1, len(ids)):
+                if self._pumps_are_series(ids[i], ids[j]):
+                    union(ids[i], ids[j], "series")
+                elif self._pumps_are_parallel(ids[i], ids[j]):
+                    union(ids[i], ids[j], "parallel")
+
+        # Collect groups
+        buckets: Dict[str, List[str]] = {}
+        for pid in ids:
+            root = find(pid)
+            buckets.setdefault(root, []).append(pid)
+
+        groups = []
+        for root, members in buckets.items():
+            if len(members) == 1:
+                groups.append({"type": "single", "pump_ids": members})
+            else:
+                groups.append({"type": config.get(root, "single"),
+                                "pump_ids": members})
+        return groups
+
+    def compute_combined_pump_curve(self,
+                                    pump_ids: List[str],
+                                    config:   str,
+                                    n_points: int = 300
+                                    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute the combined pump curve for a series or parallel group.
+
+        Series
+        ──────
+        Same Q flows through every pump; heads add:
+            h_total(Q) = Σ h_i(Q)
+
+        Parallel
+        ────────
+        Same head across every pump; flows add.  For each head value h,
+        invert each pump curve to find Q_i(h), then sum:
+            Q_total(h) = Σ Q_i(h)
+        Returns (Q_arr, h_arr) sorted by Q ascending.
+
+        Returns empty arrays if no running pumps in the group.
+        """
+        pump_comps: List[Pump] = []
+        for pid in pump_ids:
+            edge = self.network.edges.get(pid)
+            if edge and isinstance(edge.component, Pump) and edge.component.is_on:
+                pump_comps.append(edge.component)
+
+        if not pump_comps:
+            return np.array([]), np.array([])
+
+        if config == "series":
+            # Q_max limited by the pump with the smallest free-delivery point
+            Q_maxes = [pc.get_operating_range()[1] for pc in pump_comps]
+            Q_max   = min(Q_maxes) if Q_maxes else 0.05
+            if Q_max <= 0:
+                Q_max = 0.05
+            Q_arr = np.linspace(0.0, Q_max * 1.2, n_points)
+            h_arr = np.array([sum(pc.compute_pump_head(Q) for pc in pump_comps)
+                               for Q in Q_arr])
+            mask  = h_arr >= 0
+            return Q_arr[mask], h_arr[mask]
+
+        elif config == "parallel":
+            # Sweep head from 0 up to the minimum shutoff head
+            h_max = min(pc.C for pc in pump_comps)
+            if h_max <= 0:
+                return np.array([]), np.array([])
+            h_sweep = np.linspace(0.0, h_max, n_points)
+            Q_total = np.zeros(n_points)
+
+            for i, h in enumerate(h_sweep):
+                for pc in pump_comps:
+                    # Solve  A·Q² + B·Q + (C − h) = 0  for Q ≥ 0
+                    a, b, c = pc.A, pc.B, pc.C - h
+                    if abs(a) < 1e-30:
+                        Qi = max(0.0, -c / b) if abs(b) > 1e-30 else 0.0
+                    else:
+                        disc = b * b - 4.0 * a * c
+                        if disc < 0:
+                            Qi = 0.0
+                        else:
+                            sq  = math.sqrt(disc)
+                            Qi  = max(0.0,
+                                      (-b + sq) / (2.0 * a),
+                                      (-b - sq) / (2.0 * a))
+                    Q_total[i] += max(0.0, Qi)
+
+            # Return sorted by Q ascending (head is monotone decreasing in Q)
+            order = np.argsort(Q_total)
+            return Q_total[order], h_sweep[order]
+
+        return np.array([]), np.array([])
+
+    @staticmethod
+    def find_curve_intersection(Q1: np.ndarray, h1: np.ndarray,
+                                Q2: np.ndarray, h2: np.ndarray
+                                ) -> Optional[Tuple[float, float]]:
+        """
+        Find the first intersection of two head-vs-flow curves by
+        interpolating both onto a common Q grid and locating the
+        sign-change of their difference.
+
+        Returns (Q_op, h_op) or None if no intersection is found.
+        """
+        if len(Q1) < 2 or len(Q2) < 2:
+            return None
+
+        Q_lo = max(Q1[0],  Q2[0])
+        Q_hi = min(Q1[-1], Q2[-1])
+        if Q_lo >= Q_hi:
+            return None
+
+        Q_common = np.linspace(Q_lo, Q_hi, 500)
+        h_a = np.interp(Q_common, Q1, h1)
+        h_b = np.interp(Q_common, Q2, h2)
+        diff = h_a - h_b
+
+        crossings = np.where(np.diff(np.sign(diff)))[0]
+        if not len(crossings):
+            return None
+
+        idx = crossings[0]
+        d0, d1 = diff[idx], diff[idx + 1]
+        q0, q1 = Q_common[idx], Q_common[idx + 1]
+        Q_op = q0 - d0 * (q1 - q0) / (d1 - d0) if (d1 - d0) != 0 else q0
+        h_op = float(np.interp(Q_op, Q_common, h_a))
+        return Q_op, h_op

@@ -26,8 +26,8 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QColor
 
 from components import (
-    FluidComponent, Pipe, Pump, Valve, Junction, Reservoir, Fitting,
-    FittingAttachment,
+    FluidComponent, Pipe, Pump, Valve, PRV, Junction, Reservoir, Fitting,
+    FittingAttachment, PressurizedSource,
 )
 from fluid_props import (
     DENSITY, GRAVITY,
@@ -151,7 +151,8 @@ class PropertiesPanel(QWidget):
         res_layout.setSpacing(4)
         self._res_labels: dict[str, QLabel] = {}
         for key in ("Head (m)", "Flow (L/s)", "Velocity (m/s)",
-                    "Reynolds", "f (Darcy)", "ΔH (m)"):
+                    "Reynolds", "f (Darcy)", "ΔH (m)",
+                    "Req. Head (m)", "P_req (kW)"):
             lbl = QLabel("—")
             lbl.setFont(QFont("Consolas", 8))
             res_layout.addRow(key + ":", lbl)
@@ -182,12 +183,14 @@ class PropertiesPanel(QWidget):
         self._clear_form()
 
         builder = {
-            "Reservoir": self._build_reservoir_form,
-            "Junction":  self._build_junction_form,
-            "Pipe":      self._build_pipe_form,
-            "Pump":      self._build_pump_form,
-            "Valve":     self._build_valve_form,
-            "Fitting":   self._build_fitting_form,
+            "Reservoir":         self._build_reservoir_form,
+            "PressurizedSource": self._build_pressurized_source_form,
+            "Junction":          self._build_junction_form,
+            "Pipe":              self._build_pipe_form,
+            "Pump":              self._build_pump_form,
+            "Valve":             self._build_valve_form,
+            "PRV":               self._build_prv_form,
+            "Fitting":           self._build_fitting_form,
         }.get(self._comp_type)
         if builder:
             builder(comp)
@@ -241,6 +244,8 @@ class PropertiesPanel(QWidget):
             "Reynolds":       result_dict.get("reynolds"),
             "f (Darcy)":      result_dict.get("friction_factor"),
             "ΔH (m)":         result_dict.get("head_loss"),
+            "Req. Head (m)":  result_dict.get("pump_req_head"),
+            "P_req (kW)":     result_dict.get("pump_power"),
         }
         for key, val in mapping.items():
             lbl = self._res_labels[key]
@@ -251,16 +256,57 @@ class PropertiesPanel(QWidget):
             else:
                 lbl.setText(f"{val:.4f}")
 
+        # Update inline pump-sizing labels if visible
+        h_req = result_dict.get("pump_req_head")
+        p_req = result_dict.get("pump_power")
+        if hasattr(self, '_pump_h_req_label'):
+            self._pump_h_req_label.setText(
+                f"{h_req:.3f} m" if h_req is not None else "—")
+        if hasattr(self, '_pump_p_req_label'):
+            self._pump_p_req_label.setText(
+                f"{p_req:.4f} kW" if p_req is not None else "—")
+
+        # NPSH: compute NPSHa from suction-side head if available
+        npsh_a = result_dict.get("npsh_available")
+        npsh_r = self._fields.get("npsh_required").value() if "npsh_required" in self._fields else None
+        
+        if hasattr(self, '_npsha_label') and npsh_a is not None:
+            self._npsha_label.setText(f"{npsh_a:.3f} m")
+            if npsh_r is not None and hasattr(self, '_npsh_warn_label'):
+                if npsh_a < npsh_r:
+                    self._npsh_warn_label.setText(
+                        f"⚠ Cavitation risk! NPSHa ({npsh_a:.2f} m) < NPSHr ({npsh_r:.2f} m)")
+                    self._npsh_warn_label.setStyleSheet("color:#e04040; font-weight:bold;")
+                else:
+                    margin = npsh_a - npsh_r
+                    self._npsh_warn_label.setText(f"✓ Margin = {margin:.2f} m")
+                    self._npsh_warn_label.setStyleSheet("color:#50b050;")
+
     def hide_results(self):
         self._result_box.setVisible(False)
         for lbl in self._res_labels.values():
             lbl.setText("—")
+        if hasattr(self, '_pump_h_req_label'):
+            self._pump_h_req_label.setText("Solve network first")
+        if hasattr(self, '_pump_p_req_label'):
+            self._pump_p_req_label.setText("—")
+        if hasattr(self, '_npsha_label'):
+            self._npsha_label.setText("—")
+        if hasattr(self, '_npsh_warn_label'):
+            self._npsh_warn_label.setText("")
 
     # ── Internal form helpers ─────────────────────────────────────────────────
 
     def _clear_form(self):
         self._fields.clear()
         self._computed_fields.clear()
+        
+        # Clear specific result-linked attributes to avoid RuntimeError
+        for attr in ("_pump_h_req_label", "_pump_p_req_label", 
+                      "_npsha_label", "_npsh_warn_label"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+
         while self._form_layout.count():
             item = self._form_layout.takeAt(0)
             w = item.widget()
@@ -318,6 +364,62 @@ class PropertiesPanel(QWidget):
         note = QLabel(
             "<small>Datum: z = 0 at reference plane.<br>"
             "H = z + P/(ρg)  •  Open tanks: P = 0 Pa.</small>")
+        note.setTextFormat(Qt.TextFormat.RichText)
+        note.setStyleSheet("color:#888; padding:2px;")
+        self._form_layout.addWidget(note)
+
+    def _build_pressurized_source_form(self, comp: PressurizedSource):
+        """Form for a PressurizedSource — same fields as Reservoir but emphasises pressure."""
+        self._empty_label.setVisible(False)
+        self._add_name_field(comp)
+
+        elev  = _make_spinbox(-1000, 10000, comp.elevation, 3, 0.5)
+        elev.setSuffix(" m")
+        press = _make_spinbox(0, 1e8, comp.surface_pressure_Pa, 1, 5000.0)
+        press.setSuffix(" Pa")
+        h_label = QLabel(f"{comp.total_head:.3f} m")
+        h_label.setFont(QFont("Consolas", 8))
+        h_label.setStyleSheet(
+            "color:#3a7bd5; padding:2px 4px; font-weight:bold; "
+            "background:#eef3fb; border-radius:3px;")
+
+        def _update_head():
+            H = elev.value() + press.value() / (DENSITY * GRAVITY)
+            h_label.setText(f"{H:.3f} m")
+
+        elev.valueChanged.connect(lambda _: _update_head())
+        press.valueChanged.connect(lambda _: _update_head())
+
+        self._fields["elevation"]           = elev
+        self._fields["surface_pressure_Pa"] = press
+        self._add_group("Pressurized Source", [
+            ("Elevation z:", elev),
+            ("Supply pressure:", press),
+            ("Total head H:", h_label),
+        ])
+
+        # Optional known flow rate — switches BC from fixed-head to fixed-flow
+        kfr_Ls = getattr(comp, 'known_flow_rate', 0.0) * 1000.0
+        kfr_spin = _make_spinbox(0, 10000, kfr_Ls, 3, 0.1)
+        kfr_spin.setSuffix(" L/s")
+        kfr_spin.setSpecialValueText("— (pressure BC)")
+        # Store as m³/s via computed_fields
+        self._computed_fields["known_flow_rate"] = lambda: kfr_spin.value() / 1000.0
+
+        kfr_note = QLabel(
+            "<small><b>0 L/s</b> → fixed-head BC (pressure drives flow).<br>"
+            "<b>> 0 L/s</b> → fixed-flow BC (flow rate is prescribed).</small>")
+        kfr_note.setTextFormat(Qt.TextFormat.RichText)
+        kfr_note.setStyleSheet("color:#888; padding:2px;")
+
+        self._add_group("Known Flow Rate (optional)", [
+            ("Flow rate:", kfr_spin),
+        ])
+        self._form_layout.addWidget(kfr_note)
+
+        note = QLabel(
+            "<small>H = z + P/(ρg)  •  Flow occurs when H is higher<br>"
+            "than the outlet. No pump required for pressure-driven flow.</small>")
         note.setTextFormat(Qt.TextFormat.RichText)
         note.setStyleSheet("color:#888; padding:2px;")
         self._form_layout.addWidget(note)
@@ -593,6 +695,173 @@ class PropertiesPanel(QWidget):
         gb.setLayout(fl)
         self._form_layout.addWidget(gb)
         self._add_group("Physical", [("Reference diam.:", diam), ("", is_on)])
+
+        # ── Pump Sizing / Power Estimation ────────────────────────────────────
+        qd_Ls = comp.desired_flow_rate * 1000.0
+        qd_spin = _make_spinbox(0, 10000, qd_Ls, 3, 0.1)
+        qd_spin.setSuffix(" L/s")
+        self._computed_fields["desired_flow_rate"] = lambda: qd_spin.value() / 1000.0
+
+        # Read-only labels updated after solve via show_results()
+        h_req_lbl = QLabel("Solve network first")
+        h_req_lbl.setFont(QFont("Consolas", 8))
+        h_req_lbl.setStyleSheet(
+            "color:#3a7bd5; padding:2px 4px; background:#eef3fb; border-radius:3px;")
+        p_req_lbl = QLabel("—")
+        p_req_lbl.setFont(QFont("Consolas", 8))
+        p_req_lbl.setStyleSheet(
+            "color:#3a7bd5; padding:2px 4px; background:#eef3fb; border-radius:3px;")
+
+        # Store for external update from main_window
+        self._pump_h_req_label = h_req_lbl
+        self._pump_p_req_label = p_req_lbl
+
+        # Pump type selector for curve generator
+        pump_type_combo = QComboBox()
+        pump_type_combo.addItems(["centrifugal", "mixed-flow", "axial"])
+        pump_type_combo.setMinimumWidth(110)
+
+        gen_btn = QPushButton("Generate Curve from Sizing")
+        gen_btn.setStyleSheet(
+            "QPushButton { background:#3a7bd5; color:white; padding:4px 8px; "
+            "  border-radius:4px; font-size:9px; }"
+            "QPushButton:hover { background:#5090e8; }")
+        gen_btn.clicked.connect(
+            lambda: self._on_generate_pump_curve(sa, sb, sc, qd_spin, pump_type_combo))
+
+        sizing_gb = _section("Pump Sizing Mode")
+        sizing_fl = QFormLayout()
+        sizing_fl.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        sizing_fl.setSpacing(6)
+        sizing_fl.addRow("Desired flow Q_des:", qd_spin)
+        sizing_fl.addRow("Req. head h_req:", h_req_lbl)
+        sizing_fl.addRow("Req. power P_req:", p_req_lbl)
+        sizing_fl.addRow("Pump type:", pump_type_combo)
+        sizing_fl.addRow("", gen_btn)
+        sizing_gb.setLayout(sizing_fl)
+        self._form_layout.addWidget(sizing_gb)
+
+        # ── NPSH section ──────────────────────────────────────────────────────
+        npsh_r_spin = _make_spinbox(0, 100, comp.npsh_required, 2, 0.5)
+        npsh_r_spin.setSuffix(" m")
+        self._fields["npsh_required"] = npsh_r_spin
+
+        npsha_lbl = QLabel("—")
+        npsha_lbl.setFont(QFont("Consolas", 8))
+        npsha_lbl.setStyleSheet(
+            "color:#3a7bd5; padding:2px 4px; background:#eef3fb; border-radius:3px;")
+        npsh_warn_lbl = QLabel("")
+        npsh_warn_lbl.setFont(QFont("Segoe UI", 7))
+        npsh_warn_lbl.setStyleSheet("color:#e04040;")
+        self._npsha_label = npsha_lbl
+        self._npsh_warn_label = npsh_warn_lbl
+
+        npsh_gb = _section("NPSH — Cavitation Check")
+        npsh_fl = QFormLayout()
+        npsh_fl.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        npsh_fl.setSpacing(6)
+        npsh_fl.addRow("NPSHr (required):", npsh_r_spin)
+        npsh_fl.addRow("NPSHa (available):", npsha_lbl)
+        npsh_fl.addRow("", npsh_warn_lbl)
+        npsh_gb.setLayout(npsh_fl)
+        self._form_layout.addWidget(npsh_gb)
+
+        npsh_note = QLabel(
+            "<small>NPSHa = (p_atm − p_vapor)/(ρg) + H_suction<br>"
+            "Solve network to compute NPSHa.  Warning if NPSHa &lt; NPSHr.</small>")
+        npsh_note.setTextFormat(Qt.TextFormat.RichText)
+        npsh_note.setStyleSheet("color:#888; padding:2px;")
+        self._form_layout.addWidget(npsh_note)
+
+    def _on_generate_pump_curve(self, sa, sb, sc, qd_spin, pump_type_combo):
+        """
+        Compute optimal pump curve coefficients (A, B, C) for the current
+        desired flow rate + required head, then fill in the spinboxes.
+
+        Uses h_req from the Solver Results label if available.
+        """
+        from solver import NetworkSolver
+        import re
+
+        Q_des_m3s = qd_spin.value() / 1000.0
+        if Q_des_m3s <= 0:
+            return
+
+        # Try to read h_req from the stored label
+        h_req = None
+        if hasattr(self, '_pump_h_req_label'):
+            txt = self._pump_h_req_label.text()
+            try:
+                h_req = float(txt)
+            except (ValueError, AttributeError):
+                pass
+
+        if h_req is None or h_req <= 0:
+            from PyQt6.QtWidgets import QInputDialog
+            val, ok = QInputDialog.getDouble(
+                self, "Required Head",
+                "Enter required system head h_req [m]:",
+                25.0, 0.1, 10000.0, 2)
+            if not ok:
+                return
+            h_req = val
+
+        pump_type = pump_type_combo.currentText()
+        A, B, C = NetworkSolver.generate_pump_curve(Q_des_m3s, h_req, pump_type)
+
+        sa.setValue(A)
+        sb.setValue(B)
+        sc.setValue(C)
+
+        from PyQt6.QtWidgets import QMessageBox
+        QMessageBox.information(
+            self, "Pump Curve Generated",
+            f"Pump type : {pump_type}\n"
+            f"BEP       : Q = {Q_des_m3s*1000:.2f} L/s,  h = {h_req:.2f} m\n"
+            f"Shutoff   : {C:.2f} m\n\n"
+            f"A = {A:.1f}   B = {B:.3f}   C = {C:.2f}\n\n"
+            "Press Apply Changes to save."
+        )
+
+    def _build_prv_form(self, comp: PRV):
+        """Form for a Pressure-Reducing Valve."""
+        self._empty_label.setVisible(False)
+        self._add_name_field(comp)
+
+        diam     = _make_spinbox(0.001, 5.0, comp.diameter, 4, 0.01); diam.setSuffix(" m")
+        sp_pa    = _make_spinbox(0, 2e7, comp.setpoint_Pa, 0, 10_000.0); sp_pa.setSuffix(" Pa")
+        cv_spin  = _make_spinbox(1e-8, 1.0, comp.Cv, 8, 1e-5)
+        mf_spin  = _make_spinbox(0, 100, comp.max_flow * 1000, 3, 0.1); mf_spin.setSuffix(" L/s")
+
+        # Computed field: max_flow in m³/s
+        self._computed_fields["max_flow"] = lambda: mf_spin.value() / 1000.0
+
+        sp_head_lbl = QLabel(f"{comp.setpoint_head:.3f} m")
+        sp_head_lbl.setFont(QFont("Consolas", 8))
+        sp_head_lbl.setStyleSheet(
+            "color:#3a7bd5; padding:2px 4px; background:#eef3fb; border-radius:3px;")
+
+        def _update_sp_head():
+            h = sp_pa.value() / (DENSITY * GRAVITY)
+            sp_head_lbl.setText(f"{h:.3f} m")
+
+        sp_pa.valueChanged.connect(lambda _: _update_sp_head())
+
+        self._fields.update({"diameter": diam, "setpoint_Pa": sp_pa, "Cv": cv_spin})
+        self._add_group("PRV", [
+            ("Bore diameter:", diam),
+            ("Setpoint pressure:", sp_pa),
+            ("Setpoint head:", sp_head_lbl),
+            ("Flow coeff. Cv:", cv_spin),
+            ("Max flow:", mf_spin),
+        ])
+
+        note = QLabel(
+            "<small>PRV maintains downstream pressure ≤ setpoint.<br>"
+            "Head loss: h = Q² / (Cv² · g)  (Cv in m³/s per √Pa).</small>")
+        note.setTextFormat(Qt.TextFormat.RichText)
+        note.setStyleSheet("color:#888; padding:2px;")
+        self._form_layout.addWidget(note)
 
     def _build_valve_form(self, comp: Valve):
         self._empty_label.setVisible(False)
