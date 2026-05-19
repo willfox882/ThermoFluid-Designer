@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest test_physics.py -v --tb=short)",
+      "Bash(cd *)",
+      "Bash(python -m pytest tests/test_series_bernoulli.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_parallel_physics.py -v --tb=short)",
+      "Bash(python -m pytest tests/test_pump_sizing_consistency.py -v --tb=line)",
+      "Bash(python -m pytest tests/test_random_networks.py -v --tb=line)",
+      "Bash(python -m pytest tests/ -v --tb=line)",
+      "Bash(python -m pytest test_physics.py tests/ --tb=line)"
+    ]
+  }
+}
