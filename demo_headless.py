@@ -19,6 +19,16 @@ import math
 # Ensure project root is on path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+# The report uses Unicode box-drawing characters (═, ✓, →).  On consoles whose
+# default encoding cannot represent them — notably Windows cp1252 when stdout is
+# piped or redirected (e.g. in CI) — print() would raise UnicodeEncodeError and
+# crash the demo.  Reconfigure the streams to UTF-8 so the demo always runs.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8")
+    except (AttributeError, ValueError):
+        pass   # stream may not be a reconfigurable TextIOWrapper
+
 from fluid_props import DENSITY, VISCOSITY, GRAVITY
 from components import Pipe, Pump, Valve, Junction, Reservoir
 from network import PipeNetwork
