@@ -316,7 +316,15 @@ class Pump(FluidComponent):
     """
     Centrifugal pump:  hp(Q) = A·Q² + B·Q + C   [m]
     Network sign convention:  h_L = −hp(Q)
+
+    When switched OFF the pump is modelled as a CLOSED LINK (check-valve
+    behaviour, matching EPANET): a very large hydraulic resistance ``OFF_K``
+    drives the flow through it to ≈0.  This is more physical than a lossless
+    pass-through and gives the energy row a non-zero Q-derivative, avoiding a
+    singular Jacobian when an idle pump is the only edge at a free node.
     """
+
+    OFF_K = 1e8   # closed-link loss coefficient (same magnitude as a shut valve)
 
     def __init__(self,
                  component_id: str,
@@ -369,12 +377,21 @@ class Pump(FluidComponent):
 
     def compute_head_loss(self, Q: float) -> float:
         if not self.is_on:
-            return 0.0
+            # OFF → closed link: high-resistance loss that blocks the flow.
+            if abs(Q) < 1e-14:
+                return 0.0
+            V_abs = abs(Q) / self.area
+            return math.copysign(1.0, Q) * self.OFF_K * V_abs**2 / (2.0 * GRAVITY)
         return -self.compute_pump_head(Q)
 
     def dhead_loss_dQ(self, Q: float, eps: float = 1e-8) -> float:
         if not self.is_on:
-            return 0.0
+            # Derivative of the closed-link resistance (same form as a shut valve).
+            if abs(Q) < 1e-10:
+                eps_fd = 1e-7
+                return (self.compute_head_loss(eps_fd)
+                        - self.compute_head_loss(-eps_fd)) / (2.0 * eps_fd)
+            return self.OFF_K * abs(Q) / (GRAVITY * self.area**2)
         return -(2.0 * self.A * Q + self.B)
 
     def compute_reynolds(self, Q: float) -> float:

@@ -226,6 +226,18 @@ class TestPump:
         pump_off = Pump('Poff', A=-5000.0, B=0.0, C=25.0, is_on=False)
         assert pump_off.compute_pump_head(0.01) == 0.0
 
+    def test_off_pump_is_high_resistance(self):
+        """Improvement #2: an OFF pump acts as a closed link (huge loss), not a
+        lossless pass-through."""
+        on  = Pump('On',  A=-5000.0, B=0.0, C=25.0, diameter=0.1, is_on=True)
+        off = Pump('Off', A=-5000.0, B=0.0, C=25.0, diameter=0.1, is_on=False)
+        assert off.compute_head_loss(0.01) > 1e5      # closed-link resistance
+        assert off.compute_head_loss(0.0) == 0.0
+        # Antisymmetric in Q (check valve modelled symmetrically here)
+        assert abs(off.compute_head_loss(0.01) + off.compute_head_loss(-0.01)) < 1e-6
+        # Jacobian is finite & positive (no singular zero-derivative)
+        assert off.dhead_loss_dQ(0.01) > 0
+
     def test_validate_stable_curve(self):
         errs = self.pump.validate()
         assert errs == [], f"Valid pump should have no errors: {errs}"
@@ -586,6 +598,33 @@ class TestSolver:
         for eid, edge in net.edges.items():
             dH = r.heads[edge.from_node_id] - r.heads[edge.to_node_id]
             assert abs(dH - r.head_losses[eid]) < 1e-7
+
+    def test_off_pump_blocks_flow(self):
+        """Improvement #2: a 20 m head across an OFF pump yields ~0 flow."""
+        net = PipeNetwork()
+        net.add_node(Reservoir('R1', total_head=20.0))
+        net.add_node(Reservoir('R2', total_head=0.0))
+        net.add_node(Junction('J1', elevation=0.0))
+        net.add_edge(Pump('Pu1', A=-8000.0, B=0.0, C=30.0, diameter=0.1,
+                          is_on=False), 'R1', 'J1')
+        net.add_edge(Pipe('P1', diameter=0.1, length=100.0), 'J1', 'R2')
+        r = self._solve(net)
+        assert r.converged, r.message
+        assert abs(r.flows['Pu1']) < 1e-4, "OFF pump must throttle flow to ~0"
+        assert abs(r.flows['P1']) < 1e-4
+
+    def test_off_pump_only_edges_not_singular(self):
+        """Regression (L4): a free node whose only edges are OFF pumps used to
+        give a singular Jacobian; closed-link semantics make it solvable."""
+        net = PipeNetwork()
+        net.add_node(Reservoir('R1', total_head=20.0))
+        net.add_node(Reservoir('R2', total_head=0.0))
+        net.add_node(Junction('J1', elevation=0.0))
+        net.add_edge(Pump('Pu1', diameter=0.1, is_on=False), 'R1', 'J1')
+        net.add_edge(Pump('Pu2', diameter=0.1, is_on=False), 'J1', 'R2')
+        r = self._solve(net)
+        assert r.converged, f"Off-pump-only node should solve: {r.message}"
+        assert abs(r.flows['Pu1']) < 1e-4
 
     def test_result_carries_npsh_data(self):
         """Improvement #3: SolverResult.npsh exposes NPSHa/NPSHr/margin per pump
