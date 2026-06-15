@@ -259,6 +259,9 @@ class PropertiesPanel(QWidget):
         # Update inline pump-sizing labels if visible
         h_req = result_dict.get("pump_req_head")
         p_req = result_dict.get("pump_power")
+        # Store the raw numeric value so "Generate Curve from Sizing" can read it
+        # directly (the label text carries a " m" suffix and is NOT parseable).
+        self._pump_h_req_value = h_req
         if hasattr(self, '_pump_h_req_label'):
             self._pump_h_req_label.setText(
                 f"{h_req:.3f} m" if h_req is not None else "—")
@@ -284,6 +287,7 @@ class PropertiesPanel(QWidget):
 
     def hide_results(self):
         self._result_box.setVisible(False)
+        self._pump_h_req_value = None
         for lbl in self._res_labels.values():
             lbl.setText("—")
         if hasattr(self, '_pump_h_req_label'):
@@ -458,12 +462,10 @@ class PropertiesPanel(QWidget):
 
         diam = _make_spinbox(0.001, 5.0, comp.diameter, 4, 0.01); diam.setSuffix(" m")
         leng = _make_spinbox(0, 100000, comp.length, 2, 10.0);    leng.setSuffix(" m")
-        elev = _make_spinbox(-5000, 5000, comp.elevation_change, 3, 0.5); elev.setSuffix(" m")
 
         self._fields.update({
             "material": mat_combo, "condition": cond_combo,
             "diameter": diam, "length": leng, "roughness": rough,
-            "elevation_change": elev,
         })
         self._add_group("Pipe Material", [
             ("Material:", mat_combo), ("Condition:", cond_combo), ("Roughness ε:", rough),
@@ -490,7 +492,6 @@ class PropertiesPanel(QWidget):
         )
 
         self._add_group("Head Loss", [
-            ("Elev. change Δz:", elev),
             ("Fittings ΣK:", k_computed_lbl),
             ("", use_override),
             ("Override K:", k_override_spin),
@@ -781,20 +782,21 @@ class PropertiesPanel(QWidget):
         Uses h_req from the Solver Results label if available.
         """
         from solver import NetworkSolver
-        import re
 
         Q_des_m3s = qd_spin.value() / 1000.0
         if Q_des_m3s <= 0:
             return
 
-        # Try to read h_req from the stored label
-        h_req = None
-        if hasattr(self, '_pump_h_req_label'):
-            txt = self._pump_h_req_label.text()
+        # Read h_req from the value stored by show_results() after a solve.
+        # (The label text carries a " m" suffix and cannot be float()-parsed.)
+        h_req = getattr(self, "_pump_h_req_value", None)
+        if h_req is None and hasattr(self, "_pump_h_req_label"):
+            # Fallback: strip any non-numeric suffix from the label text.
+            txt = self._pump_h_req_label.text().split()[0] if self._pump_h_req_label.text() else ""
             try:
                 h_req = float(txt)
-            except (ValueError, AttributeError):
-                pass
+            except (ValueError, AttributeError, IndexError):
+                h_req = None
 
         if h_req is None or h_req <= 0:
             from PyQt6.QtWidgets import QInputDialog

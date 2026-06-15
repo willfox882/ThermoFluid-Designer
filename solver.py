@@ -401,18 +401,26 @@ class NetworkSolver:
         H_sol = sol[:self._N]
         Q_sol = sol[self._N:]
 
-        # Update free-node heads in the model
-        for i, nid in enumerate(self._free_node_ids):
-            self.network.nodes[nid].component.head = H_sol[i]
+        def _head_of(node_id: str) -> float:
+            """Head at a node from the solution vector (free) or its fixed BC."""
+            if node_id in self._node_idx:
+                return float(H_sol[self._node_idx[node_id]])
+            return self.network.nodes[node_id].component.head
 
-        # Update edge flow rates in the model
-        for j, eid in enumerate(self._edge_ids):
-            self.network.edges[eid].flow_rate = Q_sol[j]
+        # Persist the solution into the model ONLY when it converged.  Writing
+        # back a non-converged iterate would leave stale, physically-meaningless
+        # heads/flows on the component objects that later reads might trust.
+        if converged:
+            for i, nid in enumerate(self._free_node_ids):
+                self.network.nodes[nid].component.head = float(H_sol[i])
+            for j, eid in enumerate(self._edge_ids):
+                self.network.edges[eid].flow_rate = float(Q_sol[j])
 
-        # Build result dicts
+        # Build result dicts directly from the solution vector (independent of
+        # whether the model objects were mutated above).
         from fluid_props import DENSITY, GRAVITY
         for nid, node in self.network.nodes.items():
-            H = node.component.head
+            H = _head_of(nid)
             result.heads[nid] = H
             z = getattr(node.component, "elevation", 0.0)
             result.pressures[nid] = (H - z) * DENSITY * GRAVITY
@@ -871,9 +879,9 @@ class NetworkSolver:
         if len(pump_edges) == 1:
             return [{"type": "single", "pump_ids": [pump_edges[0].edge_id]}]
 
-        # Union-Find for grouping
+        # Union-Find for grouping (group membership only; the series/parallel
+        # label is determined afterwards, pairwise, when groups are collected).
         parent: Dict[str, str] = {pe.edge_id: pe.edge_id for pe in pump_edges}
-        config: Dict[str, str] = {}   # edge_id → "series" | "parallel"
 
         def find(x: str) -> str:
             while parent[x] != x:
@@ -881,19 +889,17 @@ class NetworkSolver:
                 x = parent[x]
             return x
 
-        def union(x: str, y: str, cfg: str):
+        def union(x: str, y: str):
             rx, ry = find(x), find(y)
             if rx != ry:
                 parent[ry] = rx
-                config[rx] = cfg
 
         ids = [pe.edge_id for pe in pump_edges]
         for i in range(len(ids)):
             for j in range(i + 1, len(ids)):
-                if self._pumps_are_series(ids[i], ids[j]):
-                    union(ids[i], ids[j], "series")
-                elif self._pumps_are_parallel(ids[i], ids[j]):
-                    union(ids[i], ids[j], "parallel")
+                if (self._pumps_are_series(ids[i], ids[j])
+                        or self._pumps_are_parallel(ids[i], ids[j])):
+                    union(ids[i], ids[j])
 
         # Collect groups
         buckets: Dict[str, List[str]] = {}
@@ -905,9 +911,21 @@ class NetworkSolver:
         for root, members in buckets.items():
             if len(members) == 1:
                 groups.append({"type": "single", "pump_ids": members})
-            else:
-                groups.append({"type": config.get(root, "single"),
-                                "pump_ids": members})
+                continue
+            # Determine the group's configuration robustly by re-examining the
+            # members pairwise.  (The union-find `config` map is keyed by a root
+            # that can change under path-compression, so it is unreliable for
+            # groups of 3+ pumps — recompute it here instead.)  A group counts
+            # as "series" if any member pair is in series; otherwise "parallel".
+            cfg = "parallel"
+            for a in range(len(members)):
+                hit = False
+                for b in range(a + 1, len(members)):
+                    if self._pumps_are_series(members[a], members[b]):
+                        cfg = "series"; hit = True; break
+                if hit:
+                    break
+            groups.append({"type": cfg, "pump_ids": members})
         return groups
 
     def compute_combined_pump_curve(self,

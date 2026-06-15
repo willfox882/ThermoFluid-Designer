@@ -118,7 +118,7 @@ Each component type exposes its full parameter set:
 |---|---|
 | Reservoir | Total head H [m] |
 | Junction | Elevation z [m], demand D [m³/s] |
-| Pipe | Diameter D [m], Length L [m], Roughness ε [m], Elevation change Δz [m], Minor loss ΣK |
+| Pipe | Diameter D [m], Length L [m], Roughness ε [m], Minor loss ΣK (fittings or override) |
 | Pump | Curve coefficients A, B, C; Reference diameter; On/Off |
 | Valve | Bore diameter [m], Loss coefficient K; Open/Closed |
 

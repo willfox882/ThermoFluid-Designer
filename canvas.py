@@ -622,10 +622,15 @@ class EdgeGraphicsItem(QGraphicsItem):
         painter.setPen(pen)
         painter.drawLine(p1, p2)
 
-        # Directional arrow at 65 % along the line
+        # Directional arrow at 65 % along the line.  The arrow points in the
+        # ACTUAL flow direction: when the solved flow rate is negative the fluid
+        # travels opposite to the declared from→to edge orientation, so the
+        # arrow is reversed to match (the numeric label still shows the sign).
+        a1, a2 = ((p2, p1) if (self._flow_rate is not None and self._flow_rate < 0)
+                  else (p1, p2))
         t   = 0.65
-        ap  = QPointF(p1.x() + t*(p2.x()-p1.x()), p1.y() + t*(p2.y()-p1.y()))
-        ang = self._angle_rad()
+        ap  = QPointF(a1.x() + t*(a2.x()-a1.x()), a1.y() + t*(a2.y()-a1.y()))
+        ang = math.atan2(a2.y() - a1.y(), a2.x() - a1.x())
         arr = 10
         ax1 = QPointF(ap.x() - arr*math.cos(ang-0.38),
                       ap.y() - arr*math.sin(ang-0.38))

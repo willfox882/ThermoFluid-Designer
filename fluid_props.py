@@ -13,7 +13,11 @@ VISCOSITY    = 1.002e-3    # Pa·s  (dynamic)
 KIN_VISC     = VISCOSITY / DENSITY   # m²/s  (kinematic)
 GRAVITY      = 9.81        # m/s²
 SPEC_WEIGHT  = DENSITY * GRAVITY     # N/m³  (γ = ρg)
-VAPOR_PRESSURE = 2338.0    # Pa (at 20°C)
+VAPOR_PRESSURE = 2338.0    # Pa (saturation pressure of water at 20°C)
+ATMOSPHERIC_PRESSURE = 101325.0   # Pa  (standard sea-level atmosphere)
+# NOTE: Node pressures produced by the solver are GAUGE (referenced to
+# atmospheric: an open reservoir surface has P = 0 Pa).  To obtain an ABSOLUTE
+# pressure (e.g. for NPSHa / cavitation), add ATMOSPHERIC_PRESSURE.
 
 def get_vapor_pressure(temp_c: float = 20.0) -> float:
     """
@@ -224,11 +228,8 @@ def friction_factor(Re: float, eps_over_D: float) -> float:
     if Re < RE_LAMINAR:
         return f_lam
 
-    # Turbulent value (evaluated at actual Re or transition endpoint)
-    f_turb = friction_factor_haaland(max(Re, RE_TURBULENT), eps_over_D)
-
     if Re >= RE_TURBULENT:
-        return f_turb
+        return friction_factor_haaland(Re, eps_over_D)
 
     # Smooth linear interpolation through transition zone
     t = (Re - RE_LAMINAR) / (RE_TURBULENT - RE_LAMINAR)   # 0 → 1

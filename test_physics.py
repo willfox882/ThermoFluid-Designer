@@ -12,7 +12,7 @@ import numpy as np
 from fluid_props import (
     reynolds_number, friction_factor,
     friction_factor_laminar, friction_factor_haaland,
-    DENSITY, VISCOSITY, GRAVITY,
+    DENSITY, VISCOSITY, GRAVITY, VAPOR_PRESSURE, ATMOSPHERIC_PRESSURE,
 )
 from components import Pipe, Pump, Valve, Junction, Reservoir, component_from_dict
 from network import PipeNetwork
@@ -126,6 +126,27 @@ class TestPipe:
             assert rel_err < 1e-4, \
                 f"Q={Q}: analytic={dh_analytic:.4f} FD={dh_fd:.4f} err={rel_err*100:.4f}%"
 
+    def test_dhead_loss_dQ_accuracy_reverse_flow(self):
+        """Regression (H1): analytic Jacobian must match FD for NEGATIVE flow.
+
+        The Haaland chain-rule term previously used Q·|Q| instead of Q², which
+        flipped sign for reverse flow and produced up to ~28% Jacobian error.
+        """
+        for Q in [-1e-4, -1e-3, -0.01, -0.05, -0.1]:
+            dh_analytic = self.pipe.dhead_loss_dQ(Q)
+            eps = abs(Q) * 1e-5
+            dh_fd = (self.pipe.compute_head_loss(Q + eps) -
+                     self.pipe.compute_head_loss(Q - eps)) / (2 * eps)
+            rel_err = abs(dh_analytic - dh_fd) / abs(dh_fd)
+            assert rel_err < 1e-4, \
+                f"Q={Q}: analytic={dh_analytic:.4f} FD={dh_fd:.4f} err={rel_err*100:.4f}%"
+
+    def test_dhead_loss_dQ_even_symmetry(self):
+        """dh_L/dQ is even in Q (since h_L is odd): J(+Q) == J(-Q)."""
+        for Q in [1e-4, 1e-3, 0.01, 0.05, 0.1]:
+            assert abs(self.pipe.dhead_loss_dQ(Q) -
+                       self.pipe.dhead_loss_dQ(-Q)) < 1e-9
+
     def test_dhead_loss_dQ_near_zero(self):
         # Must not crash or return NaN near Q=0
         dh = self.pipe.dhead_loss_dQ(0.0)
@@ -155,6 +176,15 @@ class TestPipe:
         assert p2.length == self.pipe.length
         assert p2.roughness == self.pipe.roughness
         assert p2.K_minor == self.pipe.K_minor
+
+    def test_legacy_elevation_change_key_ignored(self):
+        """Backward-compat (M2): old files carry an 'elevation_change' key that
+        the model no longer uses; loading must not raise and must ignore it."""
+        d = self.pipe.to_dict()
+        d["elevation_change"] = 42.0   # simulate a v0.1 save file
+        p2 = Pipe.from_dict(d)
+        assert not hasattr(p2, "elevation_change")
+        assert p2.diameter == self.pipe.diameter
 
 
 class TestPump:
@@ -205,6 +235,36 @@ class TestPump:
         p = Pump('Pbad', A=1000.0, B=0.0, C=25.0)
         errs = p.validate()
         assert any('A' in e for e in errs)
+
+
+class TestNPSH:
+    """Regression (H2): NPSHa must use ABSOLUTE suction pressure.
+
+    The solver reports gauge pressure (open surface = 0 Pa), so compute_npsha
+    must add atmospheric pressure.  Previously it did not, which made an open
+    sump at sea level read NPSHa ≈ -0.23 m and falsely flag cavitation.
+    """
+
+    def test_npsha_open_sump_not_cavitating(self):
+        pump = Pump('Pu', npsh_required=2.0)
+        # Open sump at the surface: gauge pressure 0, negligible suction velocity.
+        npsha = pump.compute_npsha(P_suction=0.0, V_suction=0.0)
+        expected = (ATMOSPHERIC_PRESSURE - VAPOR_PRESSURE) / (DENSITY * GRAVITY)
+        assert abs(npsha - expected) < 1e-9
+        assert npsha > 9.0, f"Open sump NPSHa should be ~10 m, got {npsha:.3f}"
+        assert not pump.is_cavitating
+
+    def test_npsha_includes_velocity_head(self):
+        pump = Pump('Pu', npsh_required=2.0)
+        n0 = pump.compute_npsha(P_suction=0.0, V_suction=0.0)
+        n1 = pump.compute_npsha(P_suction=0.0, V_suction=2.0)
+        assert abs((n1 - n0) - (2.0**2 / (2 * GRAVITY))) < 1e-9
+
+    def test_npsha_low_suction_does_cavitate(self):
+        # Strong suction vacuum (≈ -0.9 bar gauge) with a high NPSHr → cavitation.
+        pump = Pump('Pu', npsh_required=8.0)
+        pump.compute_npsha(P_suction=-90000.0, V_suction=0.0)
+        assert pump.is_cavitating
 
 
 class TestValve:
@@ -503,6 +563,30 @@ class TestSolver:
         assert abs(Q_in - Q_out) < 1e-9, \
             f"Mass balance at J1: Q_in={Q_in*1e3:.4f} Q_out={Q_out*1e3:.4f} L/s"
 
+    def test_reverse_flow_edge_converges(self):
+        """Regression (H1): an edge whose declared direction opposes the actual
+        flow (negative Q) must still converge with full Jacobian accuracy.
+
+        P2 is declared J1→R2 but R2 is the HIGH reservoir, so the physical flow
+        is R2→J1, i.e. Q_P2 < 0.  This exercises the reverse-flow Jacobian term.
+        """
+        net = PipeNetwork()
+        net.add_node(Reservoir('R1', total_head=5.0))
+        net.add_node(Reservoir('R2', total_head=20.0))   # higher → feeds backward
+        net.add_node(Reservoir('R3', total_head=0.0))
+        net.add_node(Junction('J1', elevation=0.0))
+        net.add_edge(Pipe('P1', diameter=0.10, length=200.0, roughness=4.6e-5), 'R1', 'J1')
+        net.add_edge(Pipe('P2', diameter=0.10, length=200.0, roughness=4.6e-5), 'J1', 'R2')
+        net.add_edge(Pipe('P3', diameter=0.10, length=200.0, roughness=4.6e-5), 'J1', 'R3')
+        r = self._solve(net)
+        assert r.converged, f"Reverse-flow net did not converge: {r.message}"
+        assert r.residual_norm < 1e-8
+        assert r.flows['P2'] < 0, "P2 should carry reverse (negative) flow"
+        # Per-edge Bernoulli closure holds even on the reverse edge
+        for eid, edge in net.edges.items():
+            dH = r.heads[edge.from_node_id] - r.heads[edge.to_node_id]
+            assert abs(dH - r.head_losses[eid]) < 1e-7
+
     # ── 4. Demand node ─────────────────────────────────────────────────────────
 
     def test_demand_node(self):
@@ -547,6 +631,27 @@ class TestSolver:
         r2 = solver.solve()
         assert r1.converged and r2.converged
         assert abs(r1.flows['P1'] - r2.flows['P1']) < 1e-12
+
+    def test_detect_three_pumps_in_series(self):
+        """Regression (L3): 3 chained pumps must classify as one 'series' group.
+
+        The old union-find keyed the config by a root that path-compression could
+        change, mislabelling groups of 3+ pumps.
+        """
+        net = PipeNetwork()
+        net.add_node(Reservoir('R1', total_head=0.0))
+        net.add_node(Reservoir('R2', total_head=60.0))
+        net.add_node(Junction('J1', elevation=0.0))
+        net.add_node(Junction('J2', elevation=0.0))
+        net.add_node(Junction('J3', elevation=0.0))
+        net.add_edge(Pump('Pu1', A=-4000.0, B=0.0, C=25.0, diameter=0.1), 'R1', 'J1')
+        net.add_edge(Pump('Pu2', A=-4000.0, B=0.0, C=25.0, diameter=0.1), 'J1', 'J2')
+        net.add_edge(Pump('Pu3', A=-4000.0, B=0.0, C=25.0, diameter=0.1), 'J2', 'J3')
+        net.add_edge(Pipe('P1', diameter=0.1, length=100.0), 'J3', 'R2')
+        groups = NetworkSolver(net).detect_pump_groups()
+        assert len(groups) == 1, f"Expected one group, got {groups}"
+        assert groups[0]["type"] == "series"
+        assert set(groups[0]["pump_ids"]) == {'Pu1', 'Pu2', 'Pu3'}
 
     def test_system_curve_generation(self):
         net = PipeNetwork()

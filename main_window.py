@@ -1016,6 +1016,10 @@ class MainWindow(QMainWindow):
             return None, None
 
         h_req = float(np.interp(Q_des, Q_arr, h_arr))
+        if not np.isfinite(h_req):
+            # System-curve sampling failed (e.g. a sub-solve diverged → NaN);
+            # don't propagate a meaningless head/power into the UI.
+            return None, None
 
         if h_req <= 0:
             # Gravity / upstream pressure provides sufficient head — no pump needed
@@ -1170,7 +1174,21 @@ class MainWindow(QMainWindow):
                     f"Solver: ⚠ did not converge  (residual = {result.residual_norm:.2e})")
                 self._status_solver.setStyleSheet("color:#e07030;")
 
-            # ... rest of results processing ...
+            # Do NOT paint a non-converged iterate onto the canvas/plots — those
+            # numbers are not a valid solution and would mislead the user.
+            if not result.converged:
+                self._scene.clear_results()
+                self._plotter.clear()
+                self._sidebar.hide_results()
+                self._last_system_curves = {}
+                self._sidebar.show_validation_error([
+                    "Solver did not converge — results are not shown. "
+                    "Check the network for unstable pumps, closed loops with no "
+                    "outlet, or extreme parameter values."])
+                self._refresh_status()
+                return
+
+            # ── Results processing (converged solutions only) ─────────────────────
             elevations = {nid: node.component.elevation
                           for nid, node in self._network.nodes.items()
                           if isinstance(node.component, Reservoir)}

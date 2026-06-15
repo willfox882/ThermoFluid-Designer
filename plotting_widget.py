@@ -186,6 +186,8 @@ class PlottingWidget(QWidget):
                 writer.writerow(["Node ID", "Type", "Head (m)", "Elevation (m)",
                                   "Pressure (kPa)"])
                 for nid, node in self._network.nodes.items():
+                    if self._network.is_phantom(nid):
+                        continue
                     comp  = node.component
                     H     = self._result.heads.get(nid, 0.0)
                     P_kPa = self._result.pressures.get(nid, 0.0) / 1000.0
@@ -409,6 +411,8 @@ class PlottingWidget(QWidget):
         # ── Node table ────────────────────────────────────────────────
         self._node_table.setRowCount(0)
         for nid, node in self._network.nodes.items():
+            if self._network.is_phantom(nid):
+                continue   # hide pump/valve port junctions from results
             comp = node.component
             H    = result.heads.get(nid, 0.0)
             P_kPa = result.pressures.get(nid, 0.0) / 1000.0

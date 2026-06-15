@@ -26,7 +26,7 @@ from typing import List, Optional
 import numpy as np
 
 from fluid_props import (
-    DENSITY, VISCOSITY, GRAVITY, VAPOR_PRESSURE,
+    DENSITY, VISCOSITY, GRAVITY, VAPOR_PRESSURE, ATMOSPHERIC_PRESSURE,
     DEFAULT_ROUGHNESS, DEFAULT_MATERIAL, DEFAULT_CONDITION,
     friction_factor, reynolds_number,
     lookup_roughness, lookup_fitting_k,
@@ -159,7 +159,6 @@ class Pipe(FluidComponent):
                  diameter: float          = 0.1,
                  length: float            = 100.0,
                  roughness: float         = DEFAULT_ROUGHNESS,
-                 elevation_change: float  = 0.0,
                  K_minor: float           = 0.0,
                  material: str            = DEFAULT_MATERIAL,
                  condition: str           = DEFAULT_CONDITION,
@@ -168,7 +167,6 @@ class Pipe(FluidComponent):
         self.diameter         = diameter
         self.length           = length
         self.roughness        = roughness
-        self.elevation_change = elevation_change
         self.material         = material
         self.condition        = condition
 
@@ -248,12 +246,17 @@ class Pipe(FluidComponent):
 
         term1 = (f * L_D + K) * abs(Q) / (GRAVITY * A2)
 
+        # Re depends on |Q|, so dRe/d|Q| = ρD/(μ·A) (sign-independent).
         dRe_dQ   = DENSITY * self.diameter / (VISCOSITY * A_cs)
         delta_Re = max(abs(Re) * 1e-5, 0.5)
         f_plus   = friction_factor(Re + delta_Re, self.roughness / self.diameter)
         f_minus  = friction_factor(Re - delta_Re, self.roughness / self.diameter)
         df_dRe   = (f_plus - f_minus) / (2.0 * delta_Re)
-        term2    = df_dRe * dRe_dQ * L_D * Q * abs(Q) / (2.0 * GRAVITY * A2)
+        # h_L = (f·L/D + K)·Q·|Q| / (2g·A²) is ODD in Q, so dh_L/dQ must be EVEN.
+        # The friction-derivative term therefore carries Q² (= |Q|·|Q|), NOT
+        # Q·|Q| — the latter would flip sign for reverse flow and corrupt the
+        # Jacobian (up to ~28% error at low Re) on any edge with negative flow.
+        term2    = df_dRe * dRe_dQ * L_D * (Q * Q) / (2.0 * GRAVITY * A2)
 
         return term1 + term2
 
@@ -277,7 +280,6 @@ class Pipe(FluidComponent):
             "diameter":         self.diameter,
             "length":           self.length,
             "roughness":        self.roughness,
-            "elevation_change": self.elevation_change,
             "K_minor":          self.K_minor,          # legacy compat field
             "K_minor_override": self._K_minor_override,
             "fittings":         [f.to_dict() for f in self.fittings],
@@ -292,7 +294,6 @@ class Pipe(FluidComponent):
             diameter        = d.get("diameter", 0.1),
             length          = d.get("length", 100.0),
             roughness       = d.get("roughness", DEFAULT_ROUGHNESS),
-            elevation_change= d.get("elevation_change", 0.0),
             K_minor         = d.get("K_minor", 0.0),   # backward compat
             material        = d.get("material", DEFAULT_MATERIAL),
             condition       = d.get("condition", DEFAULT_CONDITION),
@@ -345,9 +346,17 @@ class Pump(FluidComponent):
     def compute_npsha(self, P_suction: float, V_suction: float) -> float:
         """
         Available Net Positive Suction Head (NPSHa).
-        NPSHa = (P_suction - P_vapor) / (rho * g) + V_suction^2 / (2 * g)
+
+            NPSHa = (P_abs - P_vapor) / (ρg) + V_suction² / (2g)
+
+        ``P_suction`` is the solver's node pressure, which is GAUGE (an open
+        reservoir surface has P = 0).  NPSHa requires the ABSOLUTE suction
+        pressure, so atmospheric pressure is added.  Omitting it understates
+        NPSHa by ~10.3 m and raises a false cavitation alarm for essentially
+        every normal installation.
         """
-        head_static = (P_suction - VAPOR_PRESSURE) / (DENSITY * GRAVITY)
+        P_abs       = P_suction + ATMOSPHERIC_PRESSURE
+        head_static = (P_abs - VAPOR_PRESSURE) / (DENSITY * GRAVITY)
         head_vel    = V_suction**2 / (2.0 * GRAVITY)
         self.npsh_available = head_static + head_vel
         self.is_cavitating  = self.npsh_available < self.npsh_required
@@ -675,9 +684,9 @@ class Reservoir(FluidComponent):
 
     def __init__(self,
                  component_id: str,
-                 total_head: float           = None,
+                 total_head: Optional[float] = None,
                  name: str                   = "",
-                 elevation: float            = None,
+                 elevation: Optional[float]  = None,
                  surface_pressure_Pa: float  = 0.0):
         super().__init__(component_id, name)
         if elevation is not None:
