@@ -110,6 +110,14 @@ class PlottingWidget(QWidget):
             ["Edge", "Type", "Flow (L/s)", "Vel (m/s)", "Reynolds", "f", "ΔH (m)"])
         table_layout.addWidget(self._edge_table)
 
+        self._lbl_npsh = QLabel("Pump Cavitation (NPSH)")
+        self._lbl_npsh.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        table_layout.addWidget(self._lbl_npsh)
+
+        self._npsh_table = self._make_table(
+            ["Pump", "NPSHa (m)", "NPSHr (m)", "Margin (m)", "Status"])
+        table_layout.addWidget(self._npsh_table)
+
         export_btn = QPushButton("Export Tables as CSV…")
         export_btn.setStyleSheet(
             "QPushButton { padding:4px 10px; font-size:10px; }"
@@ -161,6 +169,7 @@ class PlottingWidget(QWidget):
         self._draw_empty_pump_plot()
         self._node_table.setRowCount(0)
         self._edge_table.setRowCount(0)
+        self._npsh_table.setRowCount(0)
 
     def _save_plot_png(self):
         """Save the current pump curve plot as a PNG image."""
@@ -207,6 +216,18 @@ class PlottingWidget(QWidget):
                     writer.writerow([eid, type(edge.component).__name__,
                                      f"{Q*1000:.4f}", f"{V:.4f}",
                                      f"{Re:.0f}", f"{ff:.6f}", f"{hL:.4f}"])
+
+                npsh = getattr(self._result, "npsh", {}) or {}
+                if npsh:
+                    writer.writerow([])
+                    writer.writerow(["=== PUMP NPSH / CAVITATION ==="])
+                    writer.writerow(["Pump ID", "NPSHa (m)", "NPSHr (m)",
+                                     "Margin (m)", "Status"])
+                    for eid, d in npsh.items():
+                        status = "CAVITATING" if d.get("cavitating") else "OK"
+                        writer.writerow([eid, f"{d.get('available', 0.0):.4f}",
+                                         f"{d.get('required', 0.0):.4f}",
+                                         f"{d.get('margin', 0.0):.4f}", status])
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Export Error", str(e))
@@ -457,3 +478,28 @@ class PlottingWidget(QWidget):
                     it = self._edge_table.item(row, c)
                     if it:
                         it.setForeground(QColor("#2a5faa"))
+
+        # ── NPSH / cavitation table (running pumps only) ──────────────
+        npsh = getattr(result, "npsh", {}) or {}
+        self._npsh_table.setRowCount(0)
+        has_npsh = bool(npsh)
+        self._lbl_npsh.setVisible(has_npsh)
+        self._npsh_table.setVisible(has_npsh)
+        for eid, d in npsh.items():
+            cavit  = d.get("cavitating", False)
+            status = "⚠ CAVITATING" if cavit else "✓ OK"
+            row = self._npsh_table.rowCount()
+            self._npsh_table.insertRow(row)
+            data = [eid, f"{d.get('available', 0.0):.3f}",
+                    f"{d.get('required', 0.0):.3f}",
+                    f"{d.get('margin', 0.0):.3f}", status]
+            for col, val in enumerate(data):
+                item = QTableWidgetItem(str(val))
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter)
+                self._npsh_table.setItem(row, col, item)
+            if cavit:
+                for c in range(self._npsh_table.columnCount()):
+                    it = self._npsh_table.item(row, c)
+                    if it:
+                        it.setForeground(QColor("#d94040"))

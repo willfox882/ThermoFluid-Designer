@@ -76,6 +76,9 @@ class SolverResult:
         self.reynolds:         Dict[str, float] = {}   # all edges   [-]
         self.friction_factors: Dict[str, float] = {}   # all edges   [-]
         self.pressures:        Dict[str, float] = {}   # all nodes   [Pa]
+        # NPSH / cavitation per running pump edge:
+        #   {pump_edge_id: {"available", "required", "margin", "cavitating"}}
+        self.npsh:             Dict[str, dict]  = {}
 
     def __bool__(self):
         return self.converged
@@ -446,6 +449,12 @@ class NetworkSolver:
                 P_suc = result.pressures.get(edge.from_node_id, 0.0)
                 V_suc = result.velocities.get(eid, 0.0)
                 comp.compute_npsha(P_suc, V_suc)
+                result.npsh[eid] = {
+                    "available":  comp.npsh_available,
+                    "required":   comp.npsh_required,
+                    "margin":     comp.npsh_available - comp.npsh_required,
+                    "cavitating": comp.is_cavitating,
+                }
                 if comp.is_cavitating:
                     result.errors.append(f"CAVITATION WARNING: Pump {comp.id} "
                                          f"NPSHa ({comp.npsh_available:.2f} m) < "

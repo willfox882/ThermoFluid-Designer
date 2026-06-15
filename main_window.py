@@ -1307,6 +1307,18 @@ class MainWindow(QMainWindow):
                     writer.writerow([eid, type(comp).__name__,
                                      f"{Q*1000:.4f}", f"{V:.4f}",
                                      f"{Re:.0f}", f"{ff:.6f}", f"{hL:.4f}"])
+
+                npsh = getattr(result, "npsh", {}) or {}
+                if npsh:
+                    writer.writerow([])
+                    writer.writerow(["=== PUMP NPSH / CAVITATION ==="])
+                    writer.writerow(["Pump ID", "NPSHa (m)", "NPSHr (m)",
+                                     "Margin (m)", "Status"])
+                    for eid, d in npsh.items():
+                        status = "CAVITATING" if d.get("cavitating") else "OK"
+                        writer.writerow([eid, f"{d.get('available', 0.0):.4f}",
+                                         f"{d.get('required', 0.0):.4f}",
+                                         f"{d.get('margin', 0.0):.4f}", status])
             self._status_net.setText(f"  Exported results to {os.path.basename(path)}")
         except Exception as e:
             self._show_error(f"Export failed:\n{e}")

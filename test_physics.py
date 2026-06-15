@@ -587,6 +587,26 @@ class TestSolver:
             dH = r.heads[edge.from_node_id] - r.heads[edge.to_node_id]
             assert abs(dH - r.head_losses[eid]) < 1e-7
 
+    def test_result_carries_npsh_data(self):
+        """Improvement #3: SolverResult.npsh exposes NPSHa/NPSHr/margin per pump
+        so the results table + CSV can report cavitation without reaching into
+        component internals."""
+        net = PipeNetwork()
+        net.add_node(Reservoir('Rs', total_head=2.0))
+        net.add_node(Reservoir('Ra', total_head=18.0))
+        net.add_node(Junction('J1', elevation=0.0))
+        net.add_edge(Pump('Pu1', A=-8000.0, B=0.0, C=30.0, diameter=0.1,
+                          npsh_required=2.0), 'Rs', 'J1')
+        net.add_edge(Pipe('P1', diameter=0.08, length=150.0), 'J1', 'Ra')
+        r = self._solve(net)
+        assert r.converged
+        assert 'Pu1' in r.npsh, "Pump NPSH data missing from result"
+        d = r.npsh['Pu1']
+        assert abs(d["margin"] - (d["available"] - d["required"])) < 1e-9
+        assert d["required"] == 2.0
+        # With atmospheric pressure included, a +2 m suction reservoir is safe.
+        assert not d["cavitating"] and d["available"] > 9.0
+
     # ── 4. Demand node ─────────────────────────────────────────────────────────
 
     def test_demand_node(self):
