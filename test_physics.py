@@ -17,6 +17,15 @@ from fluid_props import (
 from components import Pipe, Pump, Valve, Junction, Reservoir, component_from_dict
 from network import PipeNetwork
 from solver import NetworkSolver, SolverResult
+import fluid_props
+
+
+@pytest.fixture(autouse=True)
+def _reset_fluid_temperature():
+    """Isolate tests from the global fluid-temperature state (#4)."""
+    fluid_props.set_fluid_temperature(20.0)
+    yield
+    fluid_props.set_fluid_temperature(20.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -741,6 +750,102 @@ class TestSolver:
         Q_arr, h_arr = solver.compute_system_curve('Pu1', r)
         assert len(Q_arr) > 10
         assert all(np.diff(h_arr) >= -1e-6)   # system curve is non-decreasing
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Temperature-dependent fluid properties  (Improvement #4)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFluidTemperature:
+
+    def test_default_state_is_20C_legacy_values(self):
+        """The 20 °C anchor must reproduce the legacy constants to the bit."""
+        assert fluid_props.water_density(20.0) == 998.2
+        assert fluid_props.water_viscosity(20.0) == 1.002e-3
+        assert fluid_props.water_vapor_pressure(20.0) == 2338.0
+
+    def test_set_temperature_restores_legacy_at_20(self):
+        fluid_props.set_fluid_temperature(80.0)      # perturb
+        fluid_props.set_fluid_temperature(20.0)      # restore
+        assert fluid_props.DENSITY == 998.2
+        assert fluid_props.VISCOSITY == 1.002e-3
+        assert fluid_props.VAPOR_PRESSURE == 2338.0
+
+    def test_properties_monotonic_with_temperature(self):
+        # Hotter water: less dense, less viscous, higher vapor pressure.
+        assert fluid_props.water_density(80.0) < fluid_props.water_density(20.0)
+        assert fluid_props.water_viscosity(80.0) < fluid_props.water_viscosity(20.0)
+        assert fluid_props.water_vapor_pressure(80.0) > fluid_props.water_vapor_pressure(20.0)
+
+    def test_interpolation_between_knots(self):
+        # 35 °C lies between the 30 and 40 °C rows → strictly between them.
+        mu30 = fluid_props.water_viscosity(30.0)
+        mu40 = fluid_props.water_viscosity(40.0)
+        mu35 = fluid_props.water_viscosity(35.0)
+        assert mu40 < mu35 < mu30
+
+    def test_temperature_clamped_outside_range(self):
+        assert fluid_props.water_density(-50.0) == fluid_props.water_density(0.0)
+        assert fluid_props.water_density(500.0) == fluid_props.water_density(100.0)
+
+    def test_reynolds_tracks_temperature(self):
+        from fluid_props import reynolds_number
+        fluid_props.set_fluid_temperature(20.0)
+        re_cold = reynolds_number(1.0, 0.05)
+        fluid_props.set_fluid_temperature(80.0)
+        re_hot = reynolds_number(1.0, 0.05)
+        # Lower viscosity at 80 °C → higher Re for the same V, D.
+        assert re_hot > re_cold
+
+    def test_solver_uses_network_temperature(self):
+        """Hot water (lower μ) lowers friction, so the same head difference
+        drives MORE flow.  Verifies temperature actually reaches the solver."""
+        def _net(temp_c):
+            net = PipeNetwork()
+            net.temperature_c = temp_c
+            net.add_node(Reservoir('R1', total_head=10.0))
+            net.add_node(Reservoir('R2', total_head=0.0))
+            net.add_node(Junction('J1', elevation=0.0))
+            # Small bore / modest head → viscosity-sensitive (laminar-ish) regime.
+            net.add_edge(Pipe('P1', diameter=0.02, length=200.0, roughness=0.0), 'R1', 'J1')
+            net.add_edge(Pipe('P2', diameter=0.02, length=200.0, roughness=0.0), 'J1', 'R2')
+            return net
+
+        r_cold = NetworkSolver(_net(20.0)).solve()
+        r_hot  = NetworkSolver(_net(80.0)).solve()
+        assert r_cold.converged and r_hot.converged
+        assert r_hot.flows['P1'] > r_cold.flows['P1'], \
+            "Hotter (less viscous) water should flow faster at fixed head"
+
+    def test_temperature_survives_json_roundtrip(self):
+        import tempfile, os
+        net = PipeNetwork()
+        net.temperature_c = 55.0
+        net.add_node(Reservoir('R1', total_head=20.0))
+        net.add_node(Reservoir('R2', total_head=0.0))
+        net.add_edge(Pipe('P1', diameter=0.1, length=100.0), 'R1', 'R2')
+        with tempfile.NamedTemporaryFile(suffix='.json', delete=False) as f:
+            path = f.name
+        try:
+            net.save_json(path)
+            net2 = PipeNetwork.load_json(path)
+            assert net2.temperature_c == 55.0
+        finally:
+            os.unlink(path)
+
+    def test_old_file_without_temperature_defaults_to_20(self):
+        net = PipeNetwork.from_dict({
+            "version": "2.0",
+            "nodes": [
+                {"type": "Reservoir", "id": "R1", "total_head": 20.0},
+                {"type": "Reservoir", "id": "R2", "total_head": 0.0},
+            ],
+            "edges": [
+                {"type": "Pipe", "id": "P1", "diameter": 0.1, "length": 100.0,
+                 "from_node": "R1", "to_node": "R2"},
+            ],
+        })
+        assert net.temperature_c == 20.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

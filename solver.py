@@ -52,6 +52,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from scipy.optimize import fsolve
 
+import fluid_props
 from network import PipeNetwork, NetworkEdge
 from components import Junction, Reservoir, Pump, PressurizedSource
 
@@ -326,6 +327,11 @@ class NetworkSolver:
         """
         result = SolverResult()
 
+        # 0. Apply the network's fluid temperature.  This updates ρ(T)/μ(T)/
+        #    P_vapor(T) used by every Reynolds/friction/head-loss/NPSH call for
+        #    the remainder of this solve.  Default 20 °C reproduces prior results.
+        fluid_props.set_fluid_temperature(getattr(self.network, "temperature_c", 20.0))
+
         # 1. Validate
         errors = self.network.validate()
         if errors:
@@ -558,6 +564,8 @@ class NetworkSolver:
         if pump_edge_id not in self.network.edges:
             return np.array([]), np.array([])
 
+        fluid_props.set_fluid_temperature(getattr(self.network, "temperature_c", 20.0))
+
         pump_comp = self.network.edges[pump_edge_id].component
         if not isinstance(pump_comp, Pump):
             return np.array([]), np.array([])
@@ -731,6 +739,8 @@ class NetworkSolver:
 
         Returns (Q_arr, h_sys), or empty arrays if insufficient data.
         """
+        fluid_props.set_fluid_temperature(getattr(self.network, "temperature_c", 20.0))
+
         reservoirs = self.network.get_reservoir_nodes()
         if len(reservoirs) < 2:
             return np.array([]), np.array([])

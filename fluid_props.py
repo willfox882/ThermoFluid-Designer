@@ -7,22 +7,115 @@ Default fluid: water at 20°C (SI units throughout).
 Future: add temperature-dependent properties and multi-fluid support.
 """
 
-# ── Water at 20 °C ────────────────────────────────────────────────────────────
+# ── Fluid state (water; default 20 °C) ───────────────────────────────────────
+# These five are MUTABLE module-level state.  They hold the properties of the
+# fluid at the current temperature and are updated in one place by
+# ``set_fluid_temperature``.  Their default values are water at 20 °C and are
+# kept bit-for-bit identical to previous releases (see _WATER_TABLE anchor row).
+#
+# Why mutable globals rather than threading a fluid object everywhere?
+# ────────────────────────────────────────────────────────────────────
+# Re, friction, head-loss and Jacobian code reads ρ and μ at *call time* (the
+# solver sets the temperature once per solve via set_fluid_temperature).  This
+# keeps the component physics free of an extra fluid-state parameter while still
+# making every downstream calculation temperature-aware.
+GRAVITY      = 9.81        # m/s²  (true constant — never temperature-dependent)
 DENSITY      = 998.2       # kg/m³
 VISCOSITY    = 1.002e-3    # Pa·s  (dynamic)
 KIN_VISC     = VISCOSITY / DENSITY   # m²/s  (kinematic)
-GRAVITY      = 9.81        # m/s²
 SPEC_WEIGHT  = DENSITY * GRAVITY     # N/m³  (γ = ρg)
 VAPOR_PRESSURE = 2338.0    # Pa (saturation pressure of water at 20°C)
+CURRENT_TEMPERATURE_C = 20.0       # °C — temperature the state above reflects
 ATMOSPHERIC_PRESSURE = 101325.0   # Pa  (standard sea-level atmosphere)
 # NOTE: Node pressures produced by the solver are GAUGE (referenced to
 # atmospheric: an open reservoir surface has P = 0 Pa).  To obtain an ABSOLUTE
 # pressure (e.g. for NPSHa / cavitation), add ATMOSPHERIC_PRESSURE.
 
+
+# ── Temperature-dependent water properties (liquid water at 1 atm) ───────────
+# Tabulated from standard references (Munson/Young/Okiishi Table B.1; Cengel
+# Table A-9).  Linear interpolation between knots; clamped outside 0–100 °C.
+# The 20 °C row is set EXACTLY to the legacy constants above, so the default
+# fluid state is unchanged to the bit.
+#   T[°C] : (ρ [kg/m³], μ [Pa·s], P_vapor [Pa])
+_WATER_TABLE = {
+    0.0:   (999.9, 1.787e-3,    611.0),
+    5.0:   (1000.0, 1.519e-3,   872.0),
+    10.0:  (999.7, 1.307e-3,   1228.0),
+    15.0:  (999.1, 1.139e-3,   1706.0),
+    20.0:  (998.2, 1.002e-3,   2338.0),   # ← anchor (== legacy constants)
+    25.0:  (997.0, 0.891e-3,   3169.0),
+    30.0:  (995.7, 0.798e-3,   4246.0),
+    40.0:  (992.2, 0.653e-3,   7384.0),
+    50.0:  (988.1, 0.547e-3,  12349.0),
+    60.0:  (983.2, 0.467e-3,  19940.0),
+    70.0:  (977.8, 0.404e-3,  31190.0),
+    80.0:  (971.8, 0.355e-3,  47390.0),
+    90.0:  (965.3, 0.315e-3,  70140.0),
+    100.0: (958.4, 0.282e-3, 101330.0),
+}
+
+
+def _interp_water(temp_c: float, idx: int) -> float:
+    """Linear interpolation of a _WATER_TABLE column; clamped to [0, 100] °C."""
+    if temp_c in _WATER_TABLE:           # exact knot (e.g. 20.0) → exact value
+        return _WATER_TABLE[temp_c][idx]
+    knots = sorted(_WATER_TABLE)
+    if temp_c <= knots[0]:
+        return _WATER_TABLE[knots[0]][idx]
+    if temp_c >= knots[-1]:
+        return _WATER_TABLE[knots[-1]][idx]
+    for k in range(len(knots) - 1):
+        t0, t1 = knots[k], knots[k + 1]
+        if t0 <= temp_c <= t1:
+            v0 = _WATER_TABLE[t0][idx]
+            v1 = _WATER_TABLE[t1][idx]
+            return v0 + (temp_c - t0) / (t1 - t0) * (v1 - v0)
+    return _WATER_TABLE[knots[-1]][idx]
+
+
+def water_density(temp_c: float = 20.0) -> float:
+    """Liquid-water density ρ [kg/m³] at the given temperature."""
+    return _interp_water(temp_c, 0)
+
+
+def water_viscosity(temp_c: float = 20.0) -> float:
+    """Liquid-water dynamic viscosity μ [Pa·s] at the given temperature."""
+    return _interp_water(temp_c, 1)
+
+
+def water_vapor_pressure(temp_c: float = 20.0) -> float:
+    """Saturation (vapor) pressure of water [Pa] at the given temperature."""
+    return _interp_water(temp_c, 2)
+
+
+def set_fluid_temperature(temp_c: float) -> tuple:
+    """
+    Set the current fluid temperature and update the module-level fluid state
+    (DENSITY, VISCOSITY, KIN_VISC, SPEC_WEIGHT, VAPOR_PRESSURE) accordingly.
+
+    Called once per solve by the NetworkSolver.  At 20 °C the values are
+    identical to the legacy constants, so existing behaviour is preserved.
+
+    Returns (DENSITY, VISCOSITY, VAPOR_PRESSURE).
+    """
+    global DENSITY, VISCOSITY, KIN_VISC, SPEC_WEIGHT, VAPOR_PRESSURE
+    global CURRENT_TEMPERATURE_C
+    DENSITY        = water_density(temp_c)
+    VISCOSITY      = water_viscosity(temp_c)
+    KIN_VISC       = VISCOSITY / DENSITY
+    SPEC_WEIGHT    = DENSITY * GRAVITY
+    VAPOR_PRESSURE = water_vapor_pressure(temp_c)
+    CURRENT_TEMPERATURE_C = float(temp_c)
+    return DENSITY, VISCOSITY, VAPOR_PRESSURE
+
+
 def get_vapor_pressure(temp_c: float = 20.0) -> float:
     """
-    Approximate vapor pressure of water [Pa].
-    Antoine equation coefficients for water (range 1-100°C):
+    Approximate vapor pressure of water [Pa] via the Antoine equation
+    (kept for backward compatibility; ``water_vapor_pressure`` is the
+    table-based function used by the fluid state).
+    Antoine coefficients for water (range 1-100°C):
     A=8.07131, B=1730.63, C=233.426 (for P in mmHg, T in °C)
     """
     import math
@@ -172,8 +265,19 @@ def lookup_roughness(material: str, condition: str) -> float:
 
 
 def reynolds_number(velocity: float, diameter: float,
-                    rho: float = DENSITY, mu: float = VISCOSITY) -> float:
-    """Re = ρ·V·D / μ"""
+                    rho: float = None, mu: float = None) -> float:
+    """
+    Re = ρ·V·D / μ
+
+    ``rho`` and ``mu`` default to the *current* fluid state (module globals
+    DENSITY / VISCOSITY), looked up at call time — so the value tracks the
+    temperature set by ``set_fluid_temperature``.  Pass explicit values to
+    override.
+    """
+    if rho is None:
+        rho = DENSITY
+    if mu is None:
+        mu = VISCOSITY
     return rho * abs(velocity) * diameter / mu
 
 

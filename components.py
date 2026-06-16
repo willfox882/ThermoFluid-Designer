@@ -25,13 +25,19 @@ from typing import List, Optional
 
 import numpy as np
 
+import fluid_props as fp
 from fluid_props import (
-    DENSITY, VISCOSITY, GRAVITY, VAPOR_PRESSURE, ATMOSPHERIC_PRESSURE,
+    GRAVITY, ATMOSPHERIC_PRESSURE,
     DEFAULT_ROUGHNESS, DEFAULT_MATERIAL, DEFAULT_CONDITION,
     friction_factor, reynolds_number,
     lookup_roughness, lookup_fitting_k,
     NOMINAL_TO_METRES, FITTING_K, FITTING_CATEGORIES, FITTING_DIAMETERS,
 )
+# NOTE: DENSITY, VISCOSITY and VAPOR_PRESSURE are *temperature-dependent* state
+# that the solver updates per-solve, so they are read live via the `fp` module
+# (fp.DENSITY / fp.VISCOSITY / fp.VAPOR_PRESSURE) rather than imported by name
+# (which would freeze them at import time).  GRAVITY / ATMOSPHERIC_PRESSURE are
+# true constants and are imported directly.
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -247,7 +253,7 @@ class Pipe(FluidComponent):
         term1 = (f * L_D + K) * abs(Q) / (GRAVITY * A2)
 
         # Re depends on |Q|, so dRe/d|Q| = ρD/(μ·A) (sign-independent).
-        dRe_dQ   = DENSITY * self.diameter / (VISCOSITY * A_cs)
+        dRe_dQ   = fp.DENSITY * self.diameter / (fp.VISCOSITY * A_cs)
         delta_Re = max(abs(Re) * 1e-5, 0.5)
         f_plus   = friction_factor(Re + delta_Re, self.roughness / self.diameter)
         f_minus  = friction_factor(Re - delta_Re, self.roughness / self.diameter)
@@ -364,7 +370,7 @@ class Pump(FluidComponent):
         every normal installation.
         """
         P_abs       = P_suction + ATMOSPHERIC_PRESSURE
-        head_static = (P_abs - VAPOR_PRESSURE) / (DENSITY * GRAVITY)
+        head_static = (P_abs - fp.VAPOR_PRESSURE) / (fp.DENSITY * GRAVITY)
         head_vel    = V_suction**2 / (2.0 * GRAVITY)
         self.npsh_available = head_static + head_vel
         self.is_cavitating  = self.npsh_available < self.npsh_required
@@ -660,7 +666,7 @@ class Junction(FluidComponent):
 
     @property
     def pressure_Pa(self) -> float:
-        return self.pressure_head * DENSITY * GRAVITY
+        return self.pressure_head * fp.DENSITY * GRAVITY
 
     def compute_head_loss(self, Q: float) -> float:   return 0.0
     def compute_reynolds(self, Q: float) -> float:    return 0.0
@@ -737,7 +743,7 @@ class Reservoir(FluidComponent):
 
     @property
     def total_head(self) -> float:
-        return self._elevation + self._surface_pressure_Pa / (DENSITY * GRAVITY)
+        return self._elevation + self._surface_pressure_Pa / (fp.DENSITY * GRAVITY)
 
     @total_head.setter
     def total_head(self, value: float):
@@ -874,7 +880,7 @@ class PRV(FluidComponent):
 
     @property
     def setpoint_head(self) -> float:
-        return self.setpoint_Pa / (DENSITY * GRAVITY)
+        return self.setpoint_Pa / (fp.DENSITY * GRAVITY)
 
     def compute_head_loss(self, Q: float) -> float:
         if abs(Q) < 1e-14:

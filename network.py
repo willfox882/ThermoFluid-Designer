@@ -85,6 +85,10 @@ class PipeNetwork:
         self.edges:   Dict[str, NetworkEdge] = {}
         self.canvas_positions: Dict[str, Tuple[float, float]] = {}
 
+        # Fluid temperature [°C] — drives ρ(T)/μ(T)/P_vapor(T) at solve time.
+        # Default 20 °C reproduces the historical (temperature-independent) state.
+        self.temperature_c: float = 20.0
+
         # Phantom node tracking (populated by add_inline_component)
         # phantom_nodes[phantom_node_id] = pump_or_valve_edge_id
         self.phantom_nodes:   Dict[str, str]                  = {}
@@ -363,6 +367,7 @@ class PipeNetwork:
 
         return {
             "version":           "2.0",
+            "temperature_c":     self.temperature_c,
             "nodes":             nodes_list,
             "edges":             edges_list,
             "inline_components": inline_list,
@@ -372,6 +377,7 @@ class PipeNetwork:
     def from_dict(cls, data: dict) -> "PipeNetwork":
         net     = cls()
         version = data.get("version", "1.0")
+        net.temperature_c = float(data.get("temperature_c", 20.0))
 
         # ── Nodes ────────────────────────────────────────────────────────────
         for nd in data.get("nodes", []):
