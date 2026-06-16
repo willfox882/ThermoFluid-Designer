@@ -35,6 +35,7 @@ import matplotlib.patches as mpatches
 from solver import SolverResult
 from network import PipeNetwork
 from components import Pump
+import units
 
 
 # ── Style constants ────────────────────────────────────────────────────────────
@@ -53,6 +54,7 @@ class PlottingWidget(QWidget):
         self._network:     Optional[PipeNetwork]  = None
         self._result:      Optional[SolverResult] = None
         self._pump_groups: list = []
+        self._last_system_curves: dict = {}
         self._build_ui()
 
     # ── Layout ────────────────────────────────────────────────────────────────
@@ -98,24 +100,21 @@ class PlottingWidget(QWidget):
         lbl_nodes.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         table_layout.addWidget(lbl_nodes)
 
-        self._node_table = self._make_table(
-            ["Node", "Type", "Head (m)", "Elev (m)", "Pressure (kPa)"])
+        self._node_table = self._make_table(self._node_headers())
         table_layout.addWidget(self._node_table)
 
         lbl_edges = QLabel("Edge Results")
         lbl_edges.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         table_layout.addWidget(lbl_edges)
 
-        self._edge_table = self._make_table(
-            ["Edge", "Type", "Flow (L/s)", "Vel (m/s)", "Reynolds", "f", "ΔH (m)"])
+        self._edge_table = self._make_table(self._edge_headers())
         table_layout.addWidget(self._edge_table)
 
         self._lbl_npsh = QLabel("Pump Cavitation (NPSH)")
         self._lbl_npsh.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         table_layout.addWidget(self._lbl_npsh)
 
-        self._npsh_table = self._make_table(
-            ["Pump", "NPSHa (m)", "NPSHr (m)", "Margin (m)", "Status"])
+        self._npsh_table = self._make_table(self._npsh_headers())
         table_layout.addWidget(self._npsh_table)
 
         export_btn = QPushButton("Export Tables as CSV…")
@@ -142,6 +141,33 @@ class PlottingWidget(QWidget):
         t.setMaximumHeight(200)
         return t
 
+    # ── Unit-aware headers (Improvement #5) ────────────────────────────────────
+
+    @staticmethod
+    def _node_headers() -> list[str]:
+        return ["Node", "Type", f"Head ({units.head_label()})",
+                f"Elev ({units.head_label()})",
+                f"Pressure ({units.pressure_label()})"]
+
+    @staticmethod
+    def _edge_headers() -> list[str]:
+        return ["Edge", "Type", f"Flow ({units.flow_label()})",
+                f"Vel ({units.velocity_label()})", "Reynolds", "f",
+                f"ΔH ({units.head_label()})"]
+
+    @staticmethod
+    def _npsh_headers() -> list[str]:
+        u = units.head_label()
+        return ["Pump", f"NPSHa ({u})", f"NPSHr ({u})", f"Margin ({u})", "Status"]
+
+    def refresh_units(self):
+        """Re-render tables and plot in the current unit system (View toggle)."""
+        if self._result is not None and self._network is not None:
+            self._populate_tables(self._result)
+            self._draw_pump_plot(self._last_system_curves)
+        else:
+            self._draw_empty_pump_plot()
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def set_network(self, network: PipeNetwork):
@@ -160,12 +186,14 @@ class PlottingWidget(QWidget):
         self._network     = network
         self._result      = result
         self._pump_groups = pump_groups or []
-        self._draw_pump_plot(system_curves or {})
+        self._last_system_curves = system_curves or {}
+        self._draw_pump_plot(self._last_system_curves)
         self._populate_tables(result)
 
     def clear(self):
         self._result      = None
         self._pump_groups = []
+        self._last_system_curves = {}
         self._draw_empty_pump_plot()
         self._node_table.setRowCount(0)
         self._edge_table.setRowCount(0)
@@ -191,43 +219,47 @@ class PlottingWidget(QWidget):
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
+                u_h, u_p = units.head_label(), units.pressure_label()
+                u_q, u_v = units.flow_label(), units.velocity_label()
                 writer.writerow(["=== NODE RESULTS ==="])
-                writer.writerow(["Node ID", "Type", "Head (m)", "Elevation (m)",
-                                  "Pressure (kPa)"])
+                writer.writerow(["Node ID", "Type", f"Head ({u_h})",
+                                 f"Elevation ({u_h})", f"Pressure ({u_p})"])
                 for nid, node in self._network.nodes.items():
                     if self._network.is_phantom(nid):
                         continue
                     comp  = node.component
-                    H     = self._result.heads.get(nid, 0.0)
-                    P_kPa = self._result.pressures.get(nid, 0.0) / 1000.0
-                    z     = getattr(comp, "elevation", 0.0)
+                    H     = units.head_value(self._result.heads.get(nid, 0.0))
+                    P     = units.pressure_value(self._result.pressures.get(nid, 0.0))
+                    z     = units.head_value(getattr(comp, "elevation", 0.0))
                     writer.writerow([nid, type(comp).__name__,
-                                     f"{H:.4f}", f"{z:.4f}", f"{P_kPa:.4f}"])
+                                     f"{H:.4f}", f"{z:.4f}", f"{P:.4f}"])
                 writer.writerow([])
                 writer.writerow(["=== EDGE RESULTS ==="])
-                writer.writerow(["Edge ID", "Type", "Flow (L/s)", "Vel (m/s)",
-                                  "Reynolds", "f (Darcy)", "Head Loss (m)"])
+                writer.writerow(["Edge ID", "Type", f"Flow ({u_q})", f"Vel ({u_v})",
+                                  "Reynolds", "f (Darcy)", f"Head Loss ({u_h})"])
                 for eid, edge in self._network.edges.items():
-                    Q  = self._result.flows.get(eid, 0.0)
-                    V  = self._result.velocities.get(eid, 0.0)
+                    Q  = units.flow_value(self._result.flows.get(eid, 0.0))
+                    V  = units.velocity_value(self._result.velocities.get(eid, 0.0))
                     Re = self._result.reynolds.get(eid, 0.0)
                     ff = self._result.friction_factors.get(eid, 0.0)
-                    hL = self._result.head_losses.get(eid, 0.0)
+                    hL = units.head_value(self._result.head_losses.get(eid, 0.0))
                     writer.writerow([eid, type(edge.component).__name__,
-                                     f"{Q*1000:.4f}", f"{V:.4f}",
+                                     f"{Q:.4f}", f"{V:.4f}",
                                      f"{Re:.0f}", f"{ff:.6f}", f"{hL:.4f}"])
 
                 npsh = getattr(self._result, "npsh", {}) or {}
                 if npsh:
                     writer.writerow([])
                     writer.writerow(["=== PUMP NPSH / CAVITATION ==="])
-                    writer.writerow(["Pump ID", "NPSHa (m)", "NPSHr (m)",
-                                     "Margin (m)", "Status"])
+                    writer.writerow(["Pump ID", f"NPSHa ({u_h})", f"NPSHr ({u_h})",
+                                     f"Margin ({u_h})", "Status"])
                     for eid, d in npsh.items():
                         status = "CAVITATING" if d.get("cavitating") else "OK"
-                        writer.writerow([eid, f"{d.get('available', 0.0):.4f}",
-                                         f"{d.get('required', 0.0):.4f}",
-                                         f"{d.get('margin', 0.0):.4f}", status])
+                        writer.writerow([eid,
+                                         f"{units.head_value(d.get('available', 0.0)):.4f}",
+                                         f"{units.head_value(d.get('required', 0.0)):.4f}",
+                                         f"{units.head_value(d.get('margin', 0.0)):.4f}",
+                                         status])
         except Exception as e:
             from PyQt6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Export Error", str(e))
@@ -241,8 +273,8 @@ class PlottingWidget(QWidget):
         ax.text(0.5, 0.5, "Solve the network to see\npump curve & system curve",
                 transform=ax.transAxes, ha="center", va="center",
                 color=GREY, fontsize=10, style="italic")
-        ax.set_xlabel("Flow rate Q  [L/s]", color=FG)
-        ax.set_ylabel("Head  h  [m]", color=FG)
+        ax.set_xlabel(f"Flow rate Q  [{units.flow_label()}]", color=FG)
+        ax.set_ylabel(f"Head  h  [{units.head_label()}]", color=FG)
         ax.set_title("Pump Curve & System Curve", color=FG, fontweight="bold")
         ax.tick_params(colors=GREY)
         for spine in ax.spines.values():
@@ -305,9 +337,10 @@ class PlottingWidget(QWidget):
                 ref_eid = grp["pump_ids"][0]
                 if ref_eid in system_curves:
                     Qs_arr, hs_arr = system_curves[ref_eid]
-                    Qs_Ls = Qs_arr * 1000.0
+                    Qs_Ls = units.flow_value(Qs_arr)
+                    hs_disp = units.head_value(hs_arr)
                     lbl = "System curve" if not sys_curve_plotted else "_nolegend_"
-                    line_sys, = ax.plot(Qs_Ls, hs_arr, color=BLUE, lw=2.0,
+                    line_sys, = ax.plot(Qs_Ls, hs_disp, color=BLUE, lw=2.0,
                                         linestyle="--", label=lbl)
                     if not sys_curve_plotted:
                         legend_handles.append(line_sys)
@@ -317,23 +350,25 @@ class PlottingWidget(QWidget):
                 cQ = grp.get("combined_Q")
                 ch = grp.get("combined_h")
                 if cQ is not None and len(cQ) > 1:
-                    cQ_Ls = cQ * 1000.0
+                    cQ_Ls = units.flow_value(cQ)
+                    ch_disp = units.head_value(ch)
                     cfg_label = f"Combined ({cfg})"
-                    line_comb, = ax.plot(cQ_Ls, ch, color="#a040d0", lw=2.2,
+                    line_comb, = ax.plot(cQ_Ls, ch_disp, color="#a040d0", lw=2.2,
                                          label=cfg_label)
                     legend_handles.append(line_comb)
 
                     # Combined operating point
                     op = grp.get("op_point")
                     if op is not None:
-                        Q_op_Ls = op[0] * 1000.0
-                        h_op    = op[1]
+                        Q_op_Ls = units.flow_value(op[0])
+                        h_op    = units.head_value(op[1])
                         ax.scatter([Q_op_Ls], [h_op], color=GRN, s=90, zorder=5,
                                    edgecolors="white", linewidths=1.5, marker="*")
                         ax.annotate(
-                            f" Combined OP\n Q = {Q_op_Ls:.2f} L/s\n h = {h_op:.2f} m",
+                            f" Combined OP\n Q = {Q_op_Ls:.2f} {units.flow_label()}"
+                            f"\n h = {h_op:.2f} {units.head_label()}",
                             xy=(Q_op_Ls, h_op),
-                            xytext=(Q_op_Ls + cQ_Ls[-1] * 0.05, h_op + max(ch) * 0.05),
+                            xytext=(Q_op_Ls + cQ_Ls[-1] * 0.05, h_op + max(ch_disp) * 0.05),
                             fontsize=7.5, color=FG,
                             arrowprops=dict(arrowstyle="->", color=GRN, lw=1.2),
                         )
@@ -350,11 +385,12 @@ class PlottingWidget(QWidget):
 
             # ── Individual pump characteristic curve ──────────────────────────
             Q_arr, hp_arr = pump_comp.curve_data(n_points=300)
-            Q_Ls = Q_arr * 1000.0
+            Q_Ls = units.flow_value(Q_arr)
+            hp_disp = units.head_value(hp_arr)
             # Use lighter style for individual curves in a group
             lw_ind  = 1.4 if cfg != "single" else 2.2
             ls_ind  = ":"  if cfg != "single" else "-"
-            line_pump, = ax.plot(Q_Ls, hp_arr, color=RED, lw=lw_ind,
+            line_pump, = ax.plot(Q_Ls, hp_disp, color=RED, lw=lw_ind,
                                  linestyle=ls_ind,
                                  label=f"Pump: {eid}")
             legend_handles.append(line_pump)
@@ -362,14 +398,15 @@ class PlottingWidget(QWidget):
             # ── Single-pump operating point (only when group is single) ───────
             if cfg == "single" and eid in self._result.flows:
                 Q_op    = abs(self._result.flows[eid])
-                hp_op   = abs(pump_comp.compute_pump_head(Q_op))
-                Q_op_Ls = Q_op * 1000.0
+                hp_op   = units.head_value(abs(pump_comp.compute_pump_head(Q_op)))
+                Q_op_Ls = units.flow_value(Q_op)
                 ax.scatter([Q_op_Ls], [hp_op], color=GRN, s=80, zorder=5,
                            edgecolors="white", linewidths=1.5)
                 x_off = max(Q_Ls) * 0.05 if len(Q_Ls) else 0.05
-                y_off = max(hp_arr) * 0.05 if len(hp_arr) else 0.5
+                y_off = max(hp_disp) * 0.05 if len(hp_disp) else 0.5
                 ax.annotate(
-                    f" Operating point\n Q = {Q_op_Ls:.2f} L/s\n h = {hp_op:.2f} m",
+                    f" Operating point\n Q = {Q_op_Ls:.2f} {units.flow_label()}"
+                    f"\n h = {hp_op:.2f} {units.head_label()}",
                     xy=(Q_op_Ls, hp_op),
                     xytext=(Q_op_Ls + x_off, hp_op + y_off),
                     fontsize=7.5, color=FG,
@@ -383,31 +420,32 @@ class PlottingWidget(QWidget):
         # ── Standalone system curve (no pumps in network) ─────────────────────
         if "__standalone__" in system_curves and not pump_edges:
             Qs_arr, hs_arr = system_curves["__standalone__"]
-            Qs_Ls = Qs_arr * 1000.0
-            line_sys, = ax.plot(Qs_Ls, hs_arr, color=BLUE, lw=2.0,
+            Qs_Ls = units.flow_value(Qs_arr)
+            hs_disp = units.head_value(hs_arr)
+            line_sys, = ax.plot(Qs_Ls, hs_disp, color=BLUE, lw=2.0,
                                 linestyle="--", label="System curve")
             legend_handles.append(line_sys)
 
             # Mark the natural-flow operating point (h_sys = 0 crossing)
-            zero_crossings = np.where(np.diff(np.sign(hs_arr)))[0]
+            zero_crossings = np.where(np.diff(np.sign(hs_disp)))[0]
             if len(zero_crossings):
                 idx = zero_crossings[0]
-                h0, h1 = hs_arr[idx], hs_arr[idx + 1]
+                h0, h1 = hs_disp[idx], hs_disp[idx + 1]
                 q0, q1 = Qs_Ls[idx], Qs_Ls[idx + 1]
                 Q_cross = q0 - h0 * (q1 - q0) / (h1 - h0) if h1 != h0 else q0
                 ax.axvline(Q_cross, color=GREY, lw=1.0, linestyle=":", alpha=0.7)
                 ax.annotate(
-                    f" Natural flow\n Q = {Q_cross:.2f} L/s",
+                    f" Natural flow\n Q = {Q_cross:.2f} {units.flow_label()}",
                     xy=(Q_cross, 0),
                     xytext=(Q_cross + (Qs_Ls[-1] - Qs_Ls[0]) * 0.05,
-                            max(hs_arr) * 0.15 if max(hs_arr) != 0 else 0.5),
+                            max(hs_disp) * 0.15 if max(hs_disp) != 0 else 0.5),
                     fontsize=7.5, color=GREY,
                     arrowprops=dict(arrowstyle="->", color=GREY, lw=1.0),
                 )
 
         title = "Pump Curve & System Curve" if has_on_pump else "System Curve"
-        ax.set_xlabel("Flow rate Q  [L/s]", color=FG, fontsize=9)
-        ax.set_ylabel("Head  h  [m]", color=FG, fontsize=9)
+        ax.set_xlabel(f"Flow rate Q  [{units.flow_label()}]", color=FG, fontsize=9)
+        ax.set_ylabel(f"Head  h  [{units.head_label()}]", color=FG, fontsize=9)
         ax.set_title(title, color=FG, fontweight="bold", fontsize=10)
         ax.tick_params(colors=GREY, labelsize=8)
         for spine in ax.spines.values():
@@ -427,7 +465,10 @@ class PlottingWidget(QWidget):
         if self._network is None:
             return
 
-        from fluid_props import DENSITY, GRAVITY
+        # Refresh headers so the unit labels track the active display system.
+        self._node_table.setHorizontalHeaderLabels(self._node_headers())
+        self._edge_table.setHorizontalHeaderLabels(self._edge_headers())
+        self._npsh_table.setHorizontalHeaderLabels(self._npsh_headers())
 
         # ── Node table ────────────────────────────────────────────────
         self._node_table.setRowCount(0)
@@ -435,14 +476,14 @@ class PlottingWidget(QWidget):
             if self._network.is_phantom(nid):
                 continue   # hide pump/valve port junctions from results
             comp = node.component
-            H    = result.heads.get(nid, 0.0)
-            P_kPa = result.pressures.get(nid, 0.0) / 1000.0
-            z    = getattr(comp, "elevation", 0.0)
+            H    = units.head_value(result.heads.get(nid, 0.0))
+            P    = units.pressure_value(result.pressures.get(nid, 0.0))
+            z    = units.head_value(getattr(comp, "elevation", 0.0))
 
             row = self._node_table.rowCount()
             self._node_table.insertRow(row)
             data = [nid, type(comp).__name__,
-                    f"{H:.3f}", f"{z:.2f}", f"{P_kPa:.2f}"]
+                    f"{H:.3f}", f"{z:.2f}", f"{P:.2f}"]
             for col, val in enumerate(data):
                 item = QTableWidgetItem(str(val))
                 item.setTextAlignment(
@@ -454,16 +495,16 @@ class PlottingWidget(QWidget):
         self._edge_table.setRowCount(0)
         for eid, edge in self._network.edges.items():
             comp  = edge.component
-            Q     = result.flows.get(eid, 0.0)
-            V     = result.velocities.get(eid, 0.0)
+            Q     = units.flow_value(result.flows.get(eid, 0.0))
+            V     = units.velocity_value(result.velocities.get(eid, 0.0))
             Re    = result.reynolds.get(eid, 0.0)
             f     = result.friction_factors.get(eid, 0.0)
-            hL    = result.head_losses.get(eid, 0.0)
+            hL    = units.head_value(result.head_losses.get(eid, 0.0))
 
             row = self._edge_table.rowCount()
             self._edge_table.insertRow(row)
             data = [eid, type(comp).__name__,
-                    f"{Q*1000:.3f}", f"{V:.3f}",
+                    f"{Q:.3f}", f"{V:.3f}",
                     f"{Re:,.0f}", f"{f:.5f}", f"{hL:.3f}"]
             for col, val in enumerate(data):
                 item = QTableWidgetItem(str(val))
@@ -490,9 +531,9 @@ class PlottingWidget(QWidget):
             status = "⚠ CAVITATING" if cavit else "✓ OK"
             row = self._npsh_table.rowCount()
             self._npsh_table.insertRow(row)
-            data = [eid, f"{d.get('available', 0.0):.3f}",
-                    f"{d.get('required', 0.0):.3f}",
-                    f"{d.get('margin', 0.0):.3f}", status]
+            data = [eid, f"{units.head_value(d.get('available', 0.0)):.3f}",
+                    f"{units.head_value(d.get('required', 0.0)):.3f}",
+                    f"{units.head_value(d.get('margin', 0.0)):.3f}", status]
             for col, val in enumerate(data):
                 item = QTableWidgetItem(str(val))
                 item.setTextAlignment(

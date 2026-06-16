@@ -25,7 +25,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout, QApplication, QDoubleSpinBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSlot
-from PyQt6.QtGui import QAction, QIcon, QKeySequence, QFont, QColor, QUndoStack, QUndoCommand
+from PyQt6.QtGui import (QAction, QActionGroup, QIcon, QKeySequence, QFont, QColor,
+                         QUndoStack, QUndoCommand)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -35,6 +36,7 @@ from components import (
 )
 from network import PipeNetwork
 from solver import NetworkSolver, SolverResult
+import units
 from canvas import (
     ThermofluidCanvas, ThermofluidView, CanvasSignals,
     NodeGraphicsItem, EdgeGraphicsItem, InlineComponentItem, PortItem,
@@ -589,6 +591,18 @@ class MainWindow(QMainWindow):
         act_reset.triggered.connect(self._view.zoom_reset)
         view_menu.addAction(act_reset)
 
+        view_menu.addSeparator()
+        units_menu = view_menu.addMenu("Result &Units")
+        self._units_group = QActionGroup(self)
+        self._units_group.setExclusive(True)
+        for label, system in (("SI  (m, L/s, kPa)", units.SI),
+                              ("Imperial  (ft, gpm, psi)", units.IMPERIAL)):
+            act = QAction(label, self, checkable=True)
+            act.setChecked(units.get_system() == system)
+            act.triggered.connect(lambda _checked, s=system: self._on_set_units(s))
+            self._units_group.addAction(act)
+            units_menu.addAction(act)
+
         help_menu = mb.addMenu("&Help")
         act_about = QAction("About…", self)
         act_about.triggered.connect(self._on_about)
@@ -688,6 +702,18 @@ class MainWindow(QMainWindow):
             self._temp_spin.blockSignals(True)
             self._temp_spin.setValue(getattr(self._network, "temperature_c", 20.0))
             self._temp_spin.blockSignals(False)
+
+    def _on_set_units(self, system: str):
+        """Switch the results display unit system (SI ↔ Imperial).  This is a
+        pure display change — the model and solver remain SI, so no re-solve is
+        needed; every results surface is simply re-rendered."""
+        if units.get_system() == system:
+            return
+        units.set_system(system)
+        self._plotter.refresh_units()    # tables + pump plot
+        self._sidebar.refresh_units()    # per-component results read-out
+        self._scene.update()             # canvas head / flow overlays
+        self._refresh_status()
 
     # ── Signal wiring ─────────────────────────────────────────────────────────
 
@@ -1317,43 +1343,48 @@ class MainWindow(QMainWindow):
         try:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 writer = csv.writer(f)
+                u_h, u_p = units.head_label(), units.pressure_label()
+                u_q, u_v = units.flow_label(), units.velocity_label()
                 writer.writerow(["=== NODE RESULTS ==="])
-                writer.writerow(["Node ID", "Type", "Head (m)", "Elevation (m)", "Pressure (kPa)"])
+                writer.writerow(["Node ID", "Type", f"Head ({u_h})",
+                                 f"Elevation ({u_h})", f"Pressure ({u_p})"])
                 for nid, node in self._network.nodes.items():
                     if self._network.is_phantom(nid):
                         continue
                     comp  = node.component
-                    H     = result.heads.get(nid, 0.0)
-                    P_kPa = result.pressures.get(nid, 0.0) / 1000.0
-                    z     = getattr(comp, "elevation", 0.0)
+                    H     = units.head_value(result.heads.get(nid, 0.0))
+                    P     = units.pressure_value(result.pressures.get(nid, 0.0))
+                    z     = units.head_value(getattr(comp, "elevation", 0.0))
                     writer.writerow([nid, type(comp).__name__,
-                                     f"{H:.4f}", f"{z:.4f}", f"{P_kPa:.4f}"])
+                                     f"{H:.4f}", f"{z:.4f}", f"{P:.4f}"])
                 writer.writerow([])
                 writer.writerow(["=== EDGE RESULTS ==="])
-                writer.writerow(["Edge ID", "Type", "Flow (L/s)", "Velocity (m/s)",
-                                  "Reynolds", "f (Darcy)", "Head Loss (m)"])
+                writer.writerow(["Edge ID", "Type", f"Flow ({u_q})", f"Velocity ({u_v})",
+                                  "Reynolds", "f (Darcy)", f"Head Loss ({u_h})"])
                 for eid, edge in self._network.edges.items():
                     comp = edge.component
-                    Q    = result.flows.get(eid, 0.0)
-                    V    = result.velocities.get(eid, 0.0)
+                    Q    = units.flow_value(result.flows.get(eid, 0.0))
+                    V    = units.velocity_value(result.velocities.get(eid, 0.0))
                     Re   = result.reynolds.get(eid, 0.0)
                     ff   = result.friction_factors.get(eid, 0.0)
-                    hL   = result.head_losses.get(eid, 0.0)
+                    hL   = units.head_value(result.head_losses.get(eid, 0.0))
                     writer.writerow([eid, type(comp).__name__,
-                                     f"{Q*1000:.4f}", f"{V:.4f}",
+                                     f"{Q:.4f}", f"{V:.4f}",
                                      f"{Re:.0f}", f"{ff:.6f}", f"{hL:.4f}"])
 
                 npsh = getattr(result, "npsh", {}) or {}
                 if npsh:
                     writer.writerow([])
                     writer.writerow(["=== PUMP NPSH / CAVITATION ==="])
-                    writer.writerow(["Pump ID", "NPSHa (m)", "NPSHr (m)",
-                                     "Margin (m)", "Status"])
+                    writer.writerow(["Pump ID", f"NPSHa ({u_h})", f"NPSHr ({u_h})",
+                                     f"Margin ({u_h})", "Status"])
                     for eid, d in npsh.items():
                         status = "CAVITATING" if d.get("cavitating") else "OK"
-                        writer.writerow([eid, f"{d.get('available', 0.0):.4f}",
-                                         f"{d.get('required', 0.0):.4f}",
-                                         f"{d.get('margin', 0.0):.4f}", status])
+                        writer.writerow([eid,
+                                         f"{units.head_value(d.get('available', 0.0)):.4f}",
+                                         f"{units.head_value(d.get('required', 0.0)):.4f}",
+                                         f"{units.head_value(d.get('margin', 0.0)):.4f}",
+                                         status])
             self._status_net.setText(f"  Exported results to {os.path.basename(path)}")
         except Exception as e:
             self._show_error(f"Export failed:\n{e}")

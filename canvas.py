@@ -43,6 +43,7 @@ from PyQt6.QtGui import (
 )
 
 from components import FittingAttachment
+import units
 
 # ── Colour palette ─────────────────────────────────────────────────────────────
 C = {
@@ -218,17 +219,18 @@ class NodeGraphicsItem(QGraphicsItem):
             return
         painter.setPen(QPen(QColor(30, 30, 30)))
         painter.setFont(QFont("Segoe UI", 6))
+        u = units.head_label()
         if self._elevation is not None:
             rect1 = QRectF(-self._size/2, -self._size/2 - 26, self._size, 13)
             rect2 = QRectF(-self._size/2, -self._size/2 - 13, self._size, 13)
             painter.drawText(rect1, Qt.AlignmentFlag.AlignCenter,
-                             f"H={self._result_head:.2f}m")
+                             f"H={units.head_value(self._result_head):.2f}{u}")
             painter.drawText(rect2, Qt.AlignmentFlag.AlignCenter,
-                             f"z={self._elevation:.2f}m")
+                             f"z={units.head_value(self._elevation):.2f}{u}")
         else:
             rect = QRectF(-self._size/2, -self._size/2 - 14, self._size, 14)
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter,
-                             f"H={self._result_head:.2f}m")
+                             f"H={units.head_value(self._result_head):.2f}{u}")
 
 
 class JunctionItem(NodeGraphicsItem):
@@ -648,9 +650,9 @@ class EdgeGraphicsItem(QGraphicsItem):
         perp_y =  math.cos(ang) * 18
         painter.setPen(QPen(C["text_dark"]))
         painter.setFont(QFont("Consolas", 6))
-        Q_Ls = self._flow_rate * 1000.0
+        Q_disp = units.flow_value(self._flow_rate)
         painter.drawText(QRectF(mid.x()+perp_x-28, mid.y()+perp_y-7, 56, 14),
-                         Qt.AlignmentFlag.AlignCenter, f"{Q_Ls:.2f} L/s")
+                         Qt.AlignmentFlag.AlignCenter, f"{Q_disp:.2f} {units.flow_label()}")
 
     def _draw_edge_label(self, painter: QPainter):
         mid  = self._midpoint()

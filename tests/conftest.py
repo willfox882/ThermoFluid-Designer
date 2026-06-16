@@ -10,11 +10,12 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def _reset_fluid_temperature():
-    """Isolate tests from the global fluid-temperature state (#4): reset to
-    20 °C before and after each test so a solve at a non-default temperature
-    cannot leak its ρ/μ into an unrelated test."""
-    import fluid_props
+def _reset_global_state():
+    """Isolate tests from the global fluid-temperature (#4) and display-unit
+    (#5) state: reset to 20 °C / SI before and after each test."""
+    import fluid_props, units
     fluid_props.set_fluid_temperature(20.0)
+    units.set_system(units.SI)
     yield
     fluid_props.set_fluid_temperature(20.0)
+    units.set_system(units.SI)

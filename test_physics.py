@@ -18,14 +18,18 @@ from components import Pipe, Pump, Valve, Junction, Reservoir, component_from_di
 from network import PipeNetwork
 from solver import NetworkSolver, SolverResult
 import fluid_props
+import units
 
 
 @pytest.fixture(autouse=True)
-def _reset_fluid_temperature():
-    """Isolate tests from the global fluid-temperature state (#4)."""
+def _reset_global_state():
+    """Isolate tests from the global fluid-temperature (#4) and display-unit
+    (#5) state so one test cannot leak into another."""
     fluid_props.set_fluid_temperature(20.0)
+    units.set_system(units.SI)
     yield
     fluid_props.set_fluid_temperature(20.0)
+    units.set_system(units.SI)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -750,6 +754,67 @@ class TestSolver:
         Q_arr, h_arr = solver.compute_system_curve('Pu1', r)
         assert len(Q_arr) > 10
         assert all(np.diff(h_arr) >= -1e-6)   # system curve is non-decreasing
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Display-unit conversions  (Improvement #5)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestUnits:
+
+    def test_si_is_default_and_identity(self):
+        assert units.get_system() == units.SI
+        assert units.head_value(12.5) == 12.5
+        assert units.velocity_value(3.0) == 3.0
+        # SI display convention: flow in L/s, pressure in kPa, power in kW.
+        assert units.flow_value(0.01) == 10.0
+        assert units.pressure_value(101325.0) == 101.325
+        assert units.power_value(1000.0) == 1.0
+        assert units.head_label() == "m"
+        assert units.flow_label() == "L/s"
+        assert units.pressure_label() == "kPa"
+
+    def test_imperial_conversions(self):
+        units.set_system(units.IMPERIAL)
+        assert abs(units.head_value(1.0) - 3.280839895) < 1e-6        # m → ft
+        assert abs(units.velocity_value(1.0) - 3.280839895) < 1e-6    # m/s → ft/s
+        assert abs(units.flow_value(1.0) - 15850.3231) < 1e-2         # m³/s → gpm
+        assert abs(units.pressure_value(6894.757293) - 1.0) < 1e-6    # Pa → psi
+        assert abs(units.power_value(745.6998716) - 1.0) < 1e-6       # W → hp
+        assert units.head_label() == "ft"
+        assert units.flow_label() == "gpm"
+        assert units.pressure_label() == "psi"
+        assert units.power_label() == "hp"
+
+    def test_toggle_round_trip(self):
+        assert units.get_system() == units.SI
+        assert units.toggle() == units.IMPERIAL
+        assert units.is_imperial()
+        assert units.toggle() == units.SI
+        assert not units.is_imperial()
+
+    def test_power_from_kw(self):
+        units.set_system(units.IMPERIAL)
+        # 1 kW = 1000 W → ~1.341 hp
+        assert abs(units.power_value_from_kw(1.0) - 1.34102209) < 1e-5
+        units.set_system(units.SI)
+        assert units.power_value_from_kw(2.5) == 2.5    # kW passthrough
+
+    def test_temperature_conversion(self):
+        units.set_system(units.IMPERIAL)
+        assert abs(units.temperature_value(100.0) - 212.0) < 1e-9
+        assert abs(units.temperature_value(0.0) - 32.0) < 1e-9
+        assert units.temperature_label() == "°F"
+
+    def test_array_conversion(self):
+        units.set_system(units.IMPERIAL)
+        arr = np.array([0.0, 1.0, 2.0])
+        out = units.head_value(arr)
+        assert np.allclose(out, arr * 3.280839895)
+
+    def test_unknown_system_raises(self):
+        with pytest.raises(ValueError):
+            units.set_system("furlongs")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

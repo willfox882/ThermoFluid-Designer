@@ -35,6 +35,7 @@ from fluid_props import (
     FITTING_CATEGORIES, FITTING_DIAMETERS, FITTING_K,
     lookup_fitting_k, NOMINAL_TO_METRES,
 )
+import units
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -149,14 +150,28 @@ class PropertiesPanel(QWidget):
         res_layout = QFormLayout()
         res_layout.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         res_layout.setSpacing(4)
+        # (internal key, display name, quantity for unit conversion)
+        self._res_rows = [
+            ("head",      "Head",      "head"),
+            ("flow",      "Flow",      "flow"),
+            ("velocity",  "Velocity",  "velocity"),
+            ("reynolds",  "Reynolds",  "none"),
+            ("friction",  "f (Darcy)", "none"),
+            ("head_loss", "ΔH",        "head"),
+            ("req_head",  "Req. Head", "head"),
+            ("power",     "P_req",     "power_kw"),
+        ]
         self._res_labels: dict[str, QLabel] = {}
-        for key in ("Head (m)", "Flow (L/s)", "Velocity (m/s)",
-                    "Reynolds", "f (Darcy)", "ΔH (m)",
-                    "Req. Head (m)", "P_req (kW)"):
-            lbl = QLabel("—")
-            lbl.setFont(QFont("Consolas", 8))
-            res_layout.addRow(key + ":", lbl)
-            self._res_labels[key] = lbl
+        self._res_row_caps: dict[str, QLabel] = {}
+        for key, _name, _q in self._res_rows:
+            cap = QLabel()
+            val = QLabel("—")
+            val.setFont(QFont("Consolas", 8))
+            res_layout.addRow(cap, val)
+            self._res_labels[key]   = val
+            self._res_row_caps[key] = cap
+        self._last_result_dict: dict | None = None
+        self._update_result_captions()
         self._result_box.setLayout(res_layout)
         self._result_box.setVisible(False)
         root.addWidget(self._result_box)
@@ -235,23 +250,55 @@ class PropertiesPanel(QWidget):
             self._status_label.setStyleSheet("color:#50b050;")
             self._status_label.setText("✓ Network valid")
 
+    def _update_result_captions(self):
+        """Set the Solver-Results row captions with the active unit labels."""
+        unit_fn = {
+            "head":     units.head_label,
+            "flow":     units.flow_label,
+            "velocity": units.velocity_label,
+            "power_kw": units.power_label,
+        }
+        for key, name, q in self._res_rows:
+            cap = self._res_row_caps[key]
+            cap.setText(f"{name} ({unit_fn[q]()}):" if q in unit_fn else f"{name}:")
+
+    def refresh_units(self):
+        """Re-render the results read-out in the active unit system (View toggle)."""
+        self._update_result_captions()
+        if self._result_box.isVisible() and self._last_result_dict is not None:
+            self.show_results(self._last_result_dict)
+
     def show_results(self, result_dict: dict):
         self._result_box.setVisible(True)
-        mapping = {
-            "Head (m)":       result_dict.get("head"),
-            "Flow (L/s)":     _fmt(result_dict.get("flow"), scale=1000),
-            "Velocity (m/s)": result_dict.get("velocity"),
-            "Reynolds":       result_dict.get("reynolds"),
-            "f (Darcy)":      result_dict.get("friction_factor"),
-            "ΔH (m)":         result_dict.get("head_loss"),
-            "Req. Head (m)":  result_dict.get("pump_req_head"),
-            "P_req (kW)":     result_dict.get("pump_power"),
+        self._last_result_dict = result_dict
+        self._update_result_captions()
+
+        def _conv(q, v):
+            if v is None:
+                return None
+            if q == "head":     return units.head_value(v)
+            if q == "flow":     return units.flow_value(v)
+            if q == "velocity": return units.velocity_value(v)
+            if q == "power_kw": return units.power_value_from_kw(v)
+            return v
+
+        # internal key → raw SI value from the result dict
+        raw = {
+            "head":      result_dict.get("head"),
+            "flow":      result_dict.get("flow"),
+            "velocity":  result_dict.get("velocity"),
+            "reynolds":  result_dict.get("reynolds"),
+            "friction":  result_dict.get("friction_factor"),
+            "head_loss": result_dict.get("head_loss"),
+            "req_head":  result_dict.get("pump_req_head"),
+            "power":     result_dict.get("pump_power"),
         }
-        for key, val in mapping.items():
+        for key, _name, q in self._res_rows:
             lbl = self._res_labels[key]
+            val = _conv(q, raw[key])
             if val is None:
                 lbl.setText("—")
-            elif key == "Reynolds":
+            elif key == "reynolds":
                 lbl.setText(f"{val:,.0f}")
             else:
                 lbl.setText(f"{val:.4f}")
@@ -259,30 +306,32 @@ class PropertiesPanel(QWidget):
         # Update inline pump-sizing labels if visible
         h_req = result_dict.get("pump_req_head")
         p_req = result_dict.get("pump_power")
-        # Store the raw numeric value so "Generate Curve from Sizing" can read it
-        # directly (the label text carries a " m" suffix and is NOT parseable).
+        # Store the RAW SI value so "Generate Curve from Sizing" can read it
+        # directly (the label text carries a unit suffix and is NOT parseable).
         self._pump_h_req_value = h_req
+        uh = units.head_label()
         if hasattr(self, '_pump_h_req_label'):
             self._pump_h_req_label.setText(
-                f"{h_req:.3f} m" if h_req is not None else "—")
+                f"{units.head_value(h_req):.3f} {uh}" if h_req is not None else "—")
         if hasattr(self, '_pump_p_req_label'):
             self._pump_p_req_label.setText(
-                f"{p_req:.4f} kW" if p_req is not None else "—")
+                f"{units.power_value_from_kw(p_req):.4f} {units.power_label()}"
+                if p_req is not None else "—")
 
         # NPSH: compute NPSHa from suction-side head if available
         npsh_a = result_dict.get("npsh_available")
         npsh_r = self._fields.get("npsh_required").value() if "npsh_required" in self._fields else None
-        
+
         if hasattr(self, '_npsha_label') and npsh_a is not None:
-            self._npsha_label.setText(f"{npsh_a:.3f} m")
+            self._npsha_label.setText(f"{units.head_value(npsh_a):.3f} {uh}")
             if npsh_r is not None and hasattr(self, '_npsh_warn_label'):
+                na, nr = units.head_value(npsh_a), units.head_value(npsh_r)
                 if npsh_a < npsh_r:
                     self._npsh_warn_label.setText(
-                        f"⚠ Cavitation risk! NPSHa ({npsh_a:.2f} m) < NPSHr ({npsh_r:.2f} m)")
+                        f"⚠ Cavitation risk! NPSHa ({na:.2f} {uh}) < NPSHr ({nr:.2f} {uh})")
                     self._npsh_warn_label.setStyleSheet("color:#e04040; font-weight:bold;")
                 else:
-                    margin = npsh_a - npsh_r
-                    self._npsh_warn_label.setText(f"✓ Margin = {margin:.2f} m")
+                    self._npsh_warn_label.setText(f"✓ Margin = {na - nr:.2f} {uh}")
                     self._npsh_warn_label.setStyleSheet("color:#50b050;")
 
     def hide_results(self):
