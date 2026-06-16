@@ -79,6 +79,8 @@ class SolverResult:
         # NPSH / cavitation per running pump edge:
         #   {pump_edge_id: {"available", "required", "margin", "cavitating"}}
         self.npsh:             Dict[str, dict]  = {}
+        # Diagnostics: the single worst-satisfied equation (label, residual).
+        self.worst_residual: Optional[Tuple[str, float]] = None
 
     def __bool__(self):
         return self.converged
@@ -397,8 +399,20 @@ class NetworkSolver:
         result.message       = ("The solution converged."
                                 if converged else
                                 "Newton-Raphson did not converge within the iteration limit.")
-        result.residual_norm = float(np.linalg.norm(self.residuals(sol)))
+        F_final = self.residuals(sol)
+        result.residual_norm = float(np.linalg.norm(F_final))
         result.iterations    = nfev
+
+        # Diagnostics: pinpoint the worst-satisfied equation.  Continuity rows
+        # (0…N-1) map to a free node; energy rows (N…N+P-1) map to an edge.
+        # Most useful when the solve fails — it names the offending component.
+        if F_final.size:
+            k = int(np.argmax(np.abs(F_final)))
+            if k < self._N:
+                label = f"continuity @ node {self._free_node_ids[k]}"
+            else:
+                label = f"energy @ edge {self._edge_ids[k - self._N]}"
+            result.worst_residual = (label, float(F_final[k]))
 
         # 4. Unpack and store results
         H_sol = sol[:self._N]

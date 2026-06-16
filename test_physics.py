@@ -626,6 +626,22 @@ class TestSolver:
         assert r.converged, f"Off-pump-only node should solve: {r.message}"
         assert abs(r.flows['Pu1']) < 1e-4
 
+    def test_worst_residual_diagnostic(self):
+        """Improvement #6: SolverResult.worst_residual names the worst-satisfied
+        equation (continuity@node or energy@edge) for failure diagnosis."""
+        net = PipeNetwork()
+        net.add_node(Reservoir('R1', total_head=20.0))
+        net.add_node(Reservoir('R2', total_head=0.0))
+        net.add_node(Junction('J1', elevation=0.0))
+        net.add_edge(Pipe('P1', diameter=0.10, length=300.0), 'R1', 'J1')
+        net.add_edge(Pipe('P2', diameter=0.08, length=200.0), 'J1', 'R2')
+        r = self._solve(net)
+        assert r.converged
+        assert r.worst_residual is not None
+        label, val = r.worst_residual
+        assert ('node' in label) or ('edge' in label)
+        assert abs(val) < 1e-6   # converged → worst residual is tiny
+
     def test_result_carries_npsh_data(self):
         """Improvement #3: SolverResult.npsh exposes NPSHa/NPSHr/margin per pump
         so the results table + CSV can report cavitation without reaching into

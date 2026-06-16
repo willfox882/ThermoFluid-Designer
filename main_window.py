@@ -1181,8 +1181,12 @@ class MainWindow(QMainWindow):
                 self._plotter.clear()
                 self._sidebar.hide_results()
                 self._last_system_curves = {}
+                diag = ""
+                if result.worst_residual:
+                    lbl, val = result.worst_residual
+                    diag = f"  Worst-satisfied equation: {lbl} (residual {val:.2e})."
                 self._sidebar.show_validation_error([
-                    "Solver did not converge — results are not shown. "
+                    "Solver did not converge — results are not shown." + diag,
                     "Check the network for unstable pumps, closed loops with no "
                     "outlet, or extreme parameter values."])
                 self._refresh_status()
