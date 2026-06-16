@@ -177,8 +177,11 @@ class NetworkSolver:
         F      = np.zeros(self._N + self._P)
 
         # ── Continuity (rows 0 … N-1) ────────────────────────────────
-        for i, node_id in enumerate(self._free_node_ids):
-            F[i] = np.dot(self._A[i, :], Q) - self._demand(node_id)
+        # Vectorised: F_cont = A·Q − demand  (one matrix-vector product instead
+        # of a per-row Python loop; mathematically identical).
+        if self._N:
+            demands = np.array([self._demand(nid) for nid in self._free_node_ids])
+            F[:self._N] = self._A @ Q - demands
 
         # ── Energy (rows N … N+P-1) ──────────────────────────────────
         for j, edge_id in enumerate(self._edge_ids):
