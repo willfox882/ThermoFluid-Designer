@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QTabWidget,
     QToolBar, QStatusBar, QLabel, QFileDialog,
     QMessageBox, QDockWidget, QSizePolicy,
-    QVBoxLayout, QApplication,
+    QVBoxLayout, QApplication, QDoubleSpinBox,
 )
 from PyQt6.QtCore import Qt, QTimer, QSize, pyqtSlot
 from PyQt6.QtGui import QAction, QIcon, QKeySequence, QFont, QColor, QUndoStack, QUndoCommand
@@ -656,7 +656,38 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
         btn("⟲ Fit",   "Zoom to fit",           self._view.zoom_fit)
 
+        # Fluid temperature control — drives ρ(T)/μ(T)/P_vapor(T) at solve time.
+        tb.addSeparator()
+        temp_lbl = QLabel(" Fluid T ")
+        temp_lbl.setStyleSheet("color:#ccc; font-size:11px;")
+        tb.addWidget(temp_lbl)
+        self._temp_spin = QDoubleSpinBox()
+        self._temp_spin.setRange(0.0, 100.0)
+        self._temp_spin.setSingleStep(5.0)
+        self._temp_spin.setDecimals(1)
+        self._temp_spin.setSuffix(" °C")
+        self._temp_spin.setValue(getattr(self._network, "temperature_c", 20.0))
+        self._temp_spin.setToolTip(
+            "Water temperature (0–100 °C). Sets density, viscosity and vapor "
+            "pressure used by the solver. Re-solve to apply.")
+        self._temp_spin.valueChanged.connect(self._on_temperature_changed)
+        tb.addWidget(self._temp_spin)
+
         self._act_solve.setShortcut(QKeySequence("Ctrl+Return"))
+
+    def _on_temperature_changed(self, value: float):
+        """Update the network's fluid temperature (applied on the next solve)."""
+        self._network.temperature_c = float(value)
+        self._mark_dirty()
+        self._refresh_status()
+
+    def _sync_temperature_control(self):
+        """Reflect the current network's temperature in the toolbar spinbox
+        without re-triggering the change handler (used after File→Open)."""
+        if hasattr(self, "_temp_spin"):
+            self._temp_spin.blockSignals(True)
+            self._temp_spin.setValue(getattr(self._network, "temperature_c", 20.0))
+            self._temp_spin.blockSignals(False)
 
     # ── Signal wiring ─────────────────────────────────────────────────────────
 
@@ -1379,6 +1410,7 @@ class MainWindow(QMainWindow):
         self._solver       = NetworkSolver(net)
         self._current_file = path
 
+        self._sync_temperature_control()
         self._rebuild_canvas_from_network(net)
         self._undo_stack.clear()   # File load is not undoable
         self._plotter.set_network(net)
