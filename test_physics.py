@@ -744,6 +744,139 @@ class TestSolver:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Property-based fuzzing  (Improvement #7)
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Dependency-free fuzzer (uses the stdlib `random` module so it runs in any CI
+# without the `hypothesis` package).  It generates many random *valid*
+# topologies and asserts the two conservation invariants that every physical
+# solution must satisfy:
+#
+#   • Nodal continuity :  Σ Q_in − Σ Q_out − demand ≈ 0   at each free node
+#   • Edge energy      :  H_from − H_to − h_L(Q) ≈ 0       on each edge
+#
+# These are recomputed *independently* from the converged heads/flows (not read
+# back from the solver's residual vector), so a sign error in a head-loss term
+# or a topology-handling bug surfaces as a violated invariant.  This is exactly
+# the class of defect that the H1 reverse-flow Jacobian bug belonged to.
+
+import random as _random
+
+
+class TestFuzzInvariants:
+
+    # Invariant tolerances (looser than the 1e-9 solve tol to absorb the
+    # accumulated float error of an independent recomputation).
+    CONT_TOL = 1e-6
+    ENER_TOL = 1e-5
+
+    def _check_invariants(self, net: PipeNetwork, r: SolverResult) -> None:
+        """All result values finite; if converged, conservation laws hold."""
+        for v in list(r.heads.values()) + list(r.flows.values()) + \
+                 list(r.head_losses.values()):
+            assert math.isfinite(v), "Solver produced a non-finite result"
+
+        if not r.converged:
+            return
+
+        # Nodal continuity at every free (junction) node.
+        for node in net.get_free_nodes():
+            nid = node.node_id
+            q_in = sum(r.flows[e] for e in node.connected_edge_ids
+                       if net.edges[e].to_node_id == nid)
+            q_out = sum(r.flows[e] for e in node.connected_edge_ids
+                        if net.edges[e].from_node_id == nid)
+            demand = getattr(node.component, "demand", 0.0)
+            assert abs(q_in - q_out - demand) < self.CONT_TOL, \
+                f"Continuity violated at {nid}: imbalance={q_in - q_out - demand:.2e}"
+
+        # Per-edge energy (Bernoulli) closure.
+        for eid, edge in net.edges.items():
+            dH = r.heads[edge.from_node_id] - r.heads[edge.to_node_id]
+            assert abs(dH - r.head_losses[eid]) < self.ENER_TOL, \
+                f"Energy violated on {eid}: ΔH−h_L={dH - r.head_losses[eid]:.2e}"
+
+    def _random_series_chain(self, rng: _random.Random) -> PipeNetwork:
+        """R_high → J1 → … → Jn → R_low, all pipes, random geometry."""
+        net = PipeNetwork()
+        h_hi = rng.uniform(10.0, 60.0)
+        net.add_node(Reservoir('R_hi', total_head=h_hi))
+        net.add_node(Reservoir('R_lo', total_head=0.0))
+        n_j = rng.randint(1, 4)
+        prev = 'R_hi'
+        for i in range(n_j):
+            jid = f'J{i}'
+            net.add_node(Junction(jid, elevation=rng.uniform(0.0, 5.0),
+                                   demand=rng.choice([0.0, 0.0, rng.uniform(0, 1e-3)])))
+            net.add_edge(Pipe(f'P{i}', diameter=rng.uniform(0.05, 0.2),
+                              length=rng.uniform(50.0, 500.0),
+                              roughness=rng.choice([0.0, 4.6e-5, 2.6e-4])),
+                         prev, jid)
+            prev = jid
+        net.add_edge(Pipe(f'P{n_j}', diameter=rng.uniform(0.05, 0.2),
+                          length=rng.uniform(50.0, 500.0)), prev, 'R_lo')
+        return net
+
+    def _random_parallel(self, rng: _random.Random) -> PipeNetwork:
+        """R1 → Ja →[k parallel pipes]→ Jb → R2."""
+        net = PipeNetwork()
+        net.add_node(Reservoir('R1', total_head=rng.uniform(10.0, 40.0)))
+        net.add_node(Reservoir('R2', total_head=0.0))
+        net.add_node(Junction('Ja', elevation=0.0))
+        net.add_node(Junction('Jb', elevation=0.0))
+        net.add_edge(Pipe('P_in', diameter=0.15, length=rng.uniform(20, 80)),
+                     'R1', 'Ja')
+        for k in range(rng.randint(2, 4)):
+            net.add_edge(Pipe(f'Pp{k}', diameter=rng.uniform(0.06, 0.14),
+                              length=rng.uniform(100, 400)), 'Ja', 'Jb')
+        net.add_edge(Pipe('P_out', diameter=0.15, length=rng.uniform(20, 80)),
+                     'Jb', 'R2')
+        return net
+
+    def _random_pump(self, rng: _random.Random) -> PipeNetwork:
+        """sump → pump → J1 → delivery reservoir."""
+        net = PipeNetwork()
+        net.add_node(Reservoir('Rs', total_head=rng.uniform(0.0, 3.0)))
+        net.add_node(Reservoir('Rd', total_head=rng.uniform(10.0, 25.0)))
+        net.add_node(Junction('J1', elevation=0.0))
+        net.add_edge(Pump('Pu', A=-rng.uniform(3000.0, 9000.0), B=0.0,
+                          C=rng.uniform(28.0, 45.0), diameter=0.1), 'Rs', 'J1')
+        net.add_edge(Pipe('P1', diameter=rng.uniform(0.06, 0.12),
+                          length=rng.uniform(80, 300)), 'J1', 'Rd')
+        return net
+
+    def test_fuzz_series_chains(self):
+        rng = _random.Random(20240614)
+        n_conv = 0
+        for _ in range(60):
+            net = self._random_series_chain(rng)
+            r = NetworkSolver(net).solve()
+            self._check_invariants(net, r)
+            n_conv += int(r.converged)
+        assert n_conv >= 54, f"Series convergence rate too low: {n_conv}/60"
+
+    def test_fuzz_parallel_networks(self):
+        rng = _random.Random(987654321)
+        n_conv = 0
+        for _ in range(50):
+            net = self._random_parallel(rng)
+            r = NetworkSolver(net).solve()
+            self._check_invariants(net, r)
+            n_conv += int(r.converged)
+        assert n_conv >= 45, f"Parallel convergence rate too low: {n_conv}/50"
+
+    def test_fuzz_pump_networks(self):
+        rng = _random.Random(424242)
+        n_conv = 0
+        for _ in range(50):
+            net = self._random_pump(rng)
+            r = NetworkSolver(net).solve()
+            self._check_invariants(net, r)
+            n_conv += int(r.converged)
+        assert n_conv >= 42, f"Pump convergence rate too low: {n_conv}/50"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 
